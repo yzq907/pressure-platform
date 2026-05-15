@@ -1,0 +1,1 @@
+import{s as o}from"./request.a85ce533.js";const r=t=>o({url:"/config/add",method:"post",data:t}),s=(t,e)=>o({url:"/config/update/"+t,method:"post",data:e}),a=t=>o({url:"/config/list",method:"get",params:t}),d=t=>o({url:"/config/delete/"+t,method:"get"}),g=t=>o({url:"/config/options/"+t,method:"get"});export{g as a,r as b,d,a as g,s as u};

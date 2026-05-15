@@ -1,0 +1,1 @@
+import{s as t}from"./request.a85ce533.js";const e=s=>t({url:"/user/login",method:"post",data:s}),a=s=>t({url:"/user/add",method:"post",data:s}),o=s=>t({url:"/user/list",method:"get",params:s}),d=s=>t({url:"/user/updatePassword",method:"post",data:s});export{a,o as g,e as l,d as u};

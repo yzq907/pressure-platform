@@ -1,0 +1,73 @@
+version: '3.0'
+
+services:
+  mysterious-mysql:
+    container_name: mysterious-mysql
+    image: 100zz/test-mysql:${MYSQL_VERSION}
+    restart: always
+    command: --max-connections=1000 --slow_query_log=1 --slow_query_log_file=/var/lib/mysql/slow-log.log --long_query_time=1
+    volumes:
+      - ./mysql/data:/var/lib/mysql
+      - ./mysql/sql:/docker-entrypoint-initdb.d
+    environment:
+      MYSQL_ROOT_PASSWORD: Test@123456
+      MYSQL_DATABASE: mysterious
+      TZ: Asia/Shanghai
+      LANG: C.UTF-8
+    ports:
+      - "23306:3306"
+
+  mysterious-redis:
+    container_name: mysterious-redis
+    image: 100zz/test-redis:${REDIS_VERSION}
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./redis/data:/data
+      - ./redis/logs:/logs
+      - ./redis/conf/redis.conf:/etc/redis/redis.conf
+    sysctls:
+      - net.core.somaxconn=1024
+    ports:
+      - "16379:6379"
+    privileged: true
+    command: >
+      bash -c "echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf && redis-server /etc/redis/redis.conf"
+
+  mysterious-nginx:
+    container_name: mysterious-nginx
+    image: 100zz/test-nginx:${NGINX_VERSION}
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/html:/usr/share/nginx/html
+      - ./mysterious-data:/opt/mysterious/mysterious-data
+    ports:
+      - "1234:1234"
+      - "9998:9998"
+
+  mysterious:
+    container_name: mysterious
+    image: 100zz/mysterious:${MYSTERIOUS_VERSION}
+    restart: always
+    environment:
+      TZ: Asia/Shanghai
+      MYSTERIOUS_SERVER_PORT: 4321
+      MYSTERIOUS_MYSQL_URL: "mysql+asyncmy://root:Test%40123456@mysterious-mysql:3306/mysterious?charset=utf8mb4"
+      MYSTERIOUS_REDIS_URL: "redis://mysterious-redis:6379/0"
+      MYSTERIOUS_LOG_DIR: "/opt/logs"
+      MYSTERIOUS_UPLOAD_MAX_SIZE_MB: 100
+    volumes:
+      - ./logs:/opt/logs
+      - ./mysterious-jmeter:/opt/mysterious/mysterious-jmeter
+      - ./mysterious-data:/opt/mysterious/mysterious-data
+      - ./mysterious-jmx:/opt/mysterious/mysterious-jmx
+    ports:
+      - "4321:4321"
+    depends_on:
+      - mysterious-mysql
+      - mysterious-nginx
+      - mysterious-redis
