@@ -65,32 +65,31 @@ async def add_user(db: AsyncSession, param: UserParam) -> int:
     return user.id
 
 
-async def delete_user(db: AsyncSession, id: int) -> bool:
+async def delete_user(db: AsyncSession, id: int, current: UserContext) -> bool:
     existing = await user_crud.get_by_id(db, id)
     if existing is None:
         return False
+    if existing.username == "admin":
+        raise MysteriousException(Codes.FAIL, message="初始管理员不可删除")
+    if existing.id != current.id and current.username != "admin":
+        raise MysteriousException(Codes.FAIL, message="无权删除其他用户")
     return await user_crud.delete(db, id)
 
 
-async def update_user(db: AsyncSession, id: int, param: UserParam) -> bool:
-    """对齐 Java updateUser，但修复了 Java 端"更新时不加密密码"的 bug"""
+async def update_user(db: AsyncSession, id: int, param: UserParam, current: UserContext) -> bool:
+    """对齐 Java updateUser。密码修改统一走 /user/updatePassword，此处只处理 username/real_name。"""
     existing = await user_crud.get_by_id(db, id)
     if existing is None:
         return False
+    if existing.id != current.id and current.username != "admin":
+        raise MysteriousException(Codes.FAIL, message="无权修改其他用户")
 
-    # Java 端 BeanConverter 把 UserParam 整体覆盖到 UserDO，但 MyBatis 动态 SET 只更新非 null 字段。
-    # Python 这里用 model_dump(exclude_unset=True) 拿到客户端真正提交的字段，
-    # 没传的字段保持原值。
     sent = param.model_dump(exclude_unset=True, exclude_none=True, by_alias=False)
     if "username" in sent:
         existing.username = sent["username"]
     if "real_name" in sent:
         existing.real_name = sent["real_name"]
-    if "password" in sent:
-        # 修复 Java bug：更新密码时也要 bcrypt
-        existing.password = hash_password(sent["password"])
-
-    _refresh_token(existing)
+    # 密码修改统一走 /user/updatePassword，避免 /user/update/{id} 成为绕过旧密码校验的后门
     return await user_crud.update(db, existing)
 
 
@@ -132,20 +131,25 @@ async def ensure_admin_user(db: AsyncSession) -> None:
 
 
 async def update_password(
-    db: AsyncSession, user_id: int, param: UpdatePasswordParam, current: UserContext
+    db: AsyncSession, param: UpdatePasswordParam, current: UserContext
 ) -> bool:
-    """修改密码：校验旧密码，更新为新密码（bcrypt 加密）。"""
+    """修改密码：校验旧密码，更新为新密码（bcrypt 加密）。
+
+    如果 param.id 有值且与当前用户不同，视为管理员重置他人密码，跳过旧密码校验。
+    """
     if not param.old_password or not param.new_password:
         raise MysteriousException(Codes.PARAM_MISSING)
     if param.old_password == param.new_password:
         raise MysteriousException(Codes.FAIL, message="新密码不能与旧密码相同")
 
-    user = await user_crud.get_by_id(db, user_id)
+    target_id = param.id if param.id is not None else current.id
+    user = await user_crud.get_by_id(db, target_id)
     if user is None:
         raise MysteriousException(Codes.USER_NOT_EXIST)
 
-    # 校验旧密码
-    if not verify_password(param.old_password, user.password or ""):
+    # 修改自己的密码才校验旧密码；admin 重置他人密码跳过旧密码校验
+    is_self = user.id == current.id
+    if is_self and not verify_password(param.old_password, user.password or ""):
         raise MysteriousException(Codes.USER_PASSWORD_ERROR)
 
     user.password = hash_password(param.new_password)

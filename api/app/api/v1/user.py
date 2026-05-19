@@ -40,9 +40,10 @@ async def add_user(
 )
 async def delete_user(
     id: int,
+    current: UserContext = Depends(get_current_user_dep),
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
-    ok = await user_service.delete_user(db, id)
+    ok = await user_service.delete_user(db, id, current)
     return success(ok)
 
 
@@ -55,9 +56,10 @@ async def delete_user(
 async def update_user(
     id: int,
     param: UserParam,
+    current: UserContext = Depends(get_current_user_dep),
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
-    ok = await user_service.update_user(db, id, param)
+    ok = await user_service.update_user(db, id, param, current)
     return success(ok)
 
 
@@ -114,5 +116,5 @@ async def update_password(
     current: UserContext = Depends(get_current_user_dep),
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
-    ok = await user_service.update_password(db, current.id, param, current)
+    ok = await user_service.update_password(db, param, current)
     return success(ok)

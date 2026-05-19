@@ -47,6 +47,7 @@ class UserVO(CamelModel):
 class UpdatePasswordParam(CamelModel):
     """修改密码请求体"""
 
+    id: int | None = None
     old_password: str | None = None
     new_password: str | None = None
 
