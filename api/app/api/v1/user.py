@@ -8,9 +8,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_helper import record as audit_record
+from app.core.context import UserContext
 from app.core.response import PageVO, Response, success
 from app.db.session import get_db
-from app.core.context import UserContext
 from app.deps.auth import get_current_user_dep
 from app.schemas.user import UpdatePasswordParam, UserParam, UserQuery, UserVO
 from app.services import user as user_service
@@ -44,6 +45,8 @@ async def delete_user(
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await user_service.delete_user(db, id, current)
+    if ok:
+        await audit_record(db, current, "DELETE", "user", id, detail=f"删除用户 #{id}")
     return success(ok)
 
 
@@ -117,4 +120,6 @@ async def update_password(
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await user_service.update_password(db, param, current)
+    if ok:
+        await audit_record(db, current, "UPDATE", "user", current.id, detail="修改密码")
     return success(ok)

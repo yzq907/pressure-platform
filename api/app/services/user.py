@@ -12,7 +12,7 @@ from app.core.codes import Codes
 from app.core.context import UserContext
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
-from app.core.security import generate_token, hash_password, token_expire_time, verify_password
+from app.core.security import check_password_strength, generate_token, hash_password, token_expire_time, verify_password
 from app.crud import user as user_crud
 from app.models.user import User
 from app.schemas.user import UpdatePasswordParam, UserParam, UserQuery, UserVO
@@ -54,6 +54,10 @@ async def add_user(db: AsyncSession, param: UserParam) -> int:
     existing = await user_crud.get_by_username(db, param.username or "")
     if existing is not None:
         raise MysteriousException(Codes.USER_EXIST)
+
+    ok, reason = check_password_strength(param.password or "", param.username or "")
+    if not ok:
+        raise MysteriousException(Codes.USER_PASSWORD_TOO_WEAK, message=reason)
 
     user = User(
         username=param.username or "",
@@ -137,20 +141,27 @@ async def update_password(
 
     如果 param.id 有值且与当前用户不同，视为管理员重置他人密码，跳过旧密码校验。
     """
-    if not param.old_password or not param.new_password:
-        raise MysteriousException(Codes.PARAM_MISSING)
-    if param.old_password == param.new_password:
-        raise MysteriousException(Codes.FAIL, message="新密码不能与旧密码相同")
-
     target_id = param.id if param.id is not None else current.id
+    is_self = target_id == current.id
+
+    if not param.new_password:
+        raise MysteriousException(Codes.PARAM_MISSING)
+
     user = await user_crud.get_by_id(db, target_id)
     if user is None:
         raise MysteriousException(Codes.USER_NOT_EXIST)
 
-    # 修改自己的密码才校验旧密码；admin 重置他人密码跳过旧密码校验
-    is_self = user.id == current.id
-    if is_self and not verify_password(param.old_password, user.password or ""):
-        raise MysteriousException(Codes.USER_PASSWORD_ERROR)
+    if is_self:
+        if not param.old_password:
+            raise MysteriousException(Codes.PARAM_MISSING)
+        if param.old_password == param.new_password:
+            raise MysteriousException(Codes.FAIL, message="新密码不能与旧密码相同")
+        if not verify_password(param.old_password, user.password or ""):
+            raise MysteriousException(Codes.USER_PASSWORD_ERROR)
+
+    ok, reason = check_password_strength(param.new_password, user.username or "")
+    if not ok:
+        raise MysteriousException(Codes.USER_PASSWORD_TOO_WEAK, message=reason)
 
     user.password = hash_password(param.new_password)
     _refresh_token(user)

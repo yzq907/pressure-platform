@@ -100,6 +100,7 @@ async def add_testcase(db: AsyncSession, param: TestCaseParam, user: UserContext
         num_threads=param.num_threads or "",
         ramp_time=param.ramp_time or "",
         duration=param.duration or "",
+        timeout_seconds=param.timeout_seconds if param.timeout_seconds is not None else 7200,
         status=TestCaseStatus.NOT_RUN.value,
         test_case_dir=testcase_dir,
     )
@@ -136,7 +137,7 @@ async def update_testcase(
     if name_changed:
         await _cascade_description_on_rename(db, id, new_name, user)
 
-    for field in ("name", "description", "biz", "service", "version", "num_threads", "ramp_time", "duration"):
+    for field in ("name", "description", "biz", "service", "version", "num_threads", "ramp_time", "duration", "timeout_seconds"):
         if field in sent:
             setattr(existing, field, sent[field])
     stamp_modify(existing, user)
@@ -358,19 +359,22 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
             )
     enable_slaves = await node_crud.list_enable_slaves(db, region=region or None)
 
+    # 过滤掉离线的 slave
+    healthy_slaves = [s for s in enable_slaves if s.health_status == 1]
+
     # 用户可选择使用多少台 slave
-    total_available = len(enable_slaves)
+    total_available = len(healthy_slaves)
     if param.slave_count > total_available:
         raise MysteriousException(
             Codes.FAIL,
             message=f"压测机数量不足: 需要{param.slave_count}台, 可用{total_available}台",
         )
     if param.slave_count > 0 and param.slave_count <= total_available:
-        enable_slaves = enable_slaves[:param.slave_count]
+        healthy_slaves = healthy_slaves[:param.slave_count]
         region_info = f"区域={region}, " if region else ""
         log.info("%s用户指定使用 %d/%d 台 slave", region_info, param.slave_count, total_available)
 
-    for s in enable_slaves:
+    for s in healthy_slaves:
         try:
             ssh = SSHClient(s.host, s.port, s.username, s.password)
             await ssh.telnet(200)
@@ -384,7 +388,7 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
     duration = param.duration if param.duration not in (None, "") else (testcase.duration or "60")
 
     # 分布式执行：总并发数按 slave 数均分，每台只执行自己的份额
-    slave_count = len(enable_slaves)
+    slave_count = len(healthy_slaves)
     if slave_count > 1:
         per_slave = math.ceil(int(num_threads) / slave_count)
         log.info(
@@ -419,8 +423,8 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
         "-t",
         run_jmx_path,
     ]
-    if enable_slaves:
-        cmd += ["-R", ",".join(f"{s.host}:1099" for s in enable_slaves)]
+    if healthy_slaves:
+        cmd += ["-R", ",".join(f"{s.host}:1099" for s in healthy_slaves)]
     cmd += [
         "-l",
         jtl_path,

@@ -332,6 +332,48 @@ async def get_jtl_metrics(
     return _parse_jtl_metrics(jtl_path, window_sec)
 
 
+def _normalize_to_relative(items: list[dict]) -> list[dict]:
+    """将绝对时间戳转换为相对偏移（从 0s 开始），方便两份报告叠加对比。"""
+    if not items:
+        return []
+    # 原始 timestamp 是 "%H:%M:%S" 格式，先转成秒数
+    from datetime import datetime
+
+    def _to_seconds(ts: str) -> int:
+        try:
+            dt = datetime.strptime(ts, "%H:%M:%S")
+            return dt.hour * 3600 + dt.minute * 60 + dt.second
+        except ValueError:
+            return 0
+
+    base_sec = _to_seconds(items[0]["timestamp"])
+    out = []
+    for item in items:
+        sec = _to_seconds(item["timestamp"]) - base_sec
+        out.append({**item, "timestamp": f"{sec}s"})
+    return out
+
+
+async def compare_reports(
+    db: AsyncSession, base_id: int, target_id: int, window_sec: int = 5
+) -> dict:
+    """对比两份报告的 JTL 指标，返回相对时间轴数据。"""
+    base_rpt = await crud.get_by_id(db, base_id)
+    target_rpt = await crud.get_by_id(db, target_id)
+    if base_rpt is None or target_rpt is None:
+        raise MysteriousException(Codes.REPORT_NOT_EXIST)
+
+    base_metrics = await get_jtl_metrics(db, base_id, window_sec)
+    target_metrics = await get_jtl_metrics(db, target_id, window_sec)
+
+    return {
+        "base_name": base_rpt.name or f"报告 #{base_id}",
+        "target_name": target_rpt.name or f"报告 #{target_id}",
+        "base": _normalize_to_relative(base_metrics),
+        "target": _normalize_to_relative(target_metrics),
+    }
+
+
 async def get_jmeter_result_by_report(db: AsyncSession, report_id: int) -> list:
     """读取指定报告 jmeter.log 的实时 summary 数据。（兼容旧接口）"""
 

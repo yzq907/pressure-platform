@@ -21,4 +21,5 @@ class TestCase(Base, AuditMixin):
     num_threads: Mapped[str] = mapped_column(String(32), default="", server_default="")
     ramp_time: Mapped[str] = mapped_column(String(32), default="", server_default="")
     duration: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    timeout_seconds: Mapped[int] = mapped_column(SmallInteger, default=7200, server_default="7200")
     test_case_dir: Mapped[str] = mapped_column(String(255), default="", server_default="")

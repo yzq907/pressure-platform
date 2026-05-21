@@ -1,4 +1,4 @@
-"""报告自动清理服务：按 REPORT_RETENTION_DAYS 配置，每日清理过期报告。"""
+"""报告自动清理服务：按 REPORT_RETENTION_DAYS 配置，每日清理过期报告和审计日志。"""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud import report as report_crud
 from app.db.session import AsyncSessionLocal
+from app.models.audit_log import AuditLog
 from app.models.report import Report
 from app.services import config as config_service
 from app.services.report import clean_report
@@ -70,8 +72,31 @@ async def _cleanup_expired_reports(db: AsyncSession) -> int:
     return count
 
 
+async def _cleanup_audit_logs(db: AsyncSession) -> int:
+    """清理超过 AUDIT_RETENTION_DAYS 的审计日志。"""
+    try:
+        days_str = await config_service.get_value(db, "AUDIT_RETENTION_DAYS")
+        days = int(days_str)
+    except Exception:
+        log.info("AUDIT_RETENTION_DAYS 未配置或无效，跳过审计日志清理")
+        return 0
+
+    if days <= 0:
+        log.info("AUDIT_RETENTION_DAYS=%d，跳过审计日志清理", days)
+        return 0
+
+    cutoff = _now() - timedelta(days=days)
+    stmt = sql_delete(AuditLog).where(AuditLog.create_time < cutoff)
+    result = await db.execute(stmt)
+    await db.commit()
+    deleted = result.rowcount or 0
+    if deleted > 0:
+        log.info("清理 %d 条超过 %d 天的审计日志", deleted, days)
+    return deleted
+
+
 async def _cleanup_loop() -> None:
-    """后台循环：每天执行一次过期报告清理。"""
+    """后台循环：每天执行一次过期报告清理和审计日志清理。"""
     log.info("Report cleanup scheduler started")
     while True:
         try:
@@ -82,6 +107,7 @@ async def _cleanup_loop() -> None:
 
             async with AsyncSessionLocal() as db:
                 await _cleanup_expired_reports(db)
+                await _cleanup_audit_logs(db)
         except asyncio.CancelledError:
             log.info("Report cleanup scheduler cancelled")
             break

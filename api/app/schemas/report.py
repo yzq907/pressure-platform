@@ -55,3 +55,12 @@ class MetricsVO(CamelModel):
     p99_rt: float = 0.0
     error_rate: float = 0.0
     threads: int = 0
+
+
+class CompareVO(CamelModel):
+    """报告对比数据"""
+
+    base_name: str = ""
+    target_name: str = ""
+    base: list[MetricsVO] = []
+    target: list[MetricsVO] = []

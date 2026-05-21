@@ -196,6 +196,18 @@ async def trigger_now(db: AsyncSession, id: int, user: UserContext) -> bool:
 
     run_param = RunParam.model_validate(run_param_dict)
 
+    # 区域可用性检查
+    region = run_param.region.strip() if run_param.region else ""
+    if region:
+        from app.crud import node as node_crud
+        slaves = await node_crud.list_enable_slaves(db, region=region)
+        healthy = [s for s in slaves if s.health_status == 1]
+        if not healthy:
+            raise MysteriousException(
+                Codes.FAIL,
+                message=f"区域「{region}」暂无可用压力机，无法执行",
+            )
+
     from app.services.testcase import run_testcase
     await run_testcase(db, obj.test_case_id, run_param, user)
 
@@ -256,6 +268,20 @@ async def _execute_scheduled(db: AsyncSession, task: ScheduledTask) -> None:
                         task.id, task.test_case_id, tc.status if tc else "deleted")
             await _trigger_next_run(db, task)
             return
+
+        # 区域可用性检查：指定了区域但无健康 slave 时跳过
+        region = run_param.region.strip() if run_param.region else ""
+        if region:
+            from app.crud import node as node_crud
+            slaves = await node_crud.list_enable_slaves(db, region=region)
+            healthy = [s for s in slaves if s.health_status == 1]
+            if not healthy:
+                log.warning(
+                    "Scheduler: skip task %d (testcase=%d) — region '%s' has no healthy slaves",
+                    task.id, task.test_case_id, region,
+                )
+                await _trigger_next_run(db, task)
+                return
 
         from app.services.testcase import run_testcase
         await run_testcase(db, task.test_case_id, run_param, user)

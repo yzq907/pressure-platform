@@ -19,6 +19,7 @@ class TestCaseParam(CamelModel):
     num_threads: str | None = None
     ramp_time: str | None = None
     duration: str | None = None
+    timeout_seconds: int | None = 7200
 
 
 class TestCaseVO(BaseVO):
@@ -31,6 +32,7 @@ class TestCaseVO(BaseVO):
     num_threads: str = ""
     ramp_time: str = ""
     duration: str = ""
+    timeout_seconds: int = 7200
     test_case_dir: str = ""
 
 

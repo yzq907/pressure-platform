@@ -11,12 +11,14 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_helper import record as audit_record
 from app.core.codes import Codes
+from app.core.context import UserContext
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO, Response, success
 from app.db.session import get_db
 from app.deps.auth import get_current_user_dep
-from app.schemas.report import MetricsVO, ReportByTestCaseQuery, ReportQuery, ReportVO
+from app.schemas.report import CompareVO, MetricsVO, ReportByTestCaseQuery, ReportQuery, ReportVO
 from app.schemas.testcase import JMeterResultVO
 from app.services import report as service
 
@@ -77,9 +79,12 @@ async def get_by_id(
 )
 async def clean_report(
     id: int,
+    current: UserContext = Depends(get_current_user_dep),
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.clean_report(db, id)
+    if ok:
+        await audit_record(db, current, "DELETE", "report", id, detail=f"清理报告 #{id}")
     return success(ok)
 
 
@@ -112,6 +117,22 @@ async def view_report(
 ) -> Response[str]:
     url = await service.view_report(db, id)
     return success(url)
+
+
+@router.get(
+    "/compare",
+    summary="对比两份报告的 JTL 指标",
+    response_model=Response[CompareVO],
+    response_model_by_alias=True,
+)
+async def compare_reports(
+    baseId: int,
+    targetId: int,
+    window: int = 5,
+    db: AsyncSession = Depends(get_db),
+) -> Response[CompareVO]:
+    data = await service.compare_reports(db, baseId, targetId, window)
+    return success(data)
 
 
 @router.get(

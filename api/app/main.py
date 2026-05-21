@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from app.api.v1.audit_log import router as audit_log_router
 from app.api.v1.config import router as config_router
 from app.api.v1.csv import router as csv_router
 from app.api.v1.health import router as health_router
@@ -31,6 +32,31 @@ setup_logging()
 log = logging.getLogger(__name__)
 
 
+async def _recover_stuck_tasks() -> None:
+    """启动自愈：systemd restart 会清理整个 cgroup 的 jmeter 子进程，
+    但 DB 中的 RUN_ING 状态可能残留，启动时统一重置为 FAILED。"""
+    from app.core.enums import TestCaseStatus
+    from app.crud import report as report_crud, testcase as testcase_crud
+
+    async with AsyncSessionLocal() as db:
+        stuck_reports = await report_crud.has_any_running(db)
+        for rpt in stuck_reports:
+            rpt.status = TestCaseStatus.RUN_FAILED.value
+            rpt.response_data = "Master 重启，任务被终止"
+
+        stuck_tcs = await testcase_crud.list_by_status(db, TestCaseStatus.RUN_ING.value)
+        for tc in stuck_tcs:
+            tc.status = TestCaseStatus.RUN_FAILED.value
+
+        await db.commit()
+        if stuck_reports or stuck_tcs:
+            log.info(
+                "启动自愈完成：修复 %d 条报告，%d 条用例",
+                len(stuck_reports),
+                len(stuck_tcs),
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.start_time = time.monotonic()
@@ -41,17 +67,26 @@ async def lifespan(app: FastAPI):
         from app.services.user import ensure_admin_user
         await ensure_admin_user(db)
 
+    # 启动自愈：修复上次异常退出时残留的 RUN_ING 状态
+    await _recover_stuck_tasks()
+
     try:
         # 启动定时任务调度器
         from app.services.scheduled_task import start_scheduler, stop_scheduler
         from app.services.report_cleanup import start_cleanup_scheduler, stop_cleanup_scheduler
+        from app.services.node_heartbeat import start_heartbeat_scheduler, stop_heartbeat_scheduler
+        from app.services.timeout_scanner import start_timeout_scanner, stop_timeout_scanner
         start_scheduler(poll_interval=60)
         start_cleanup_scheduler()
+        start_heartbeat_scheduler()
+        start_timeout_scanner()
         yield
     finally:
         log.info("Mysterious API shutting down")
         await stop_scheduler()
         await stop_cleanup_scheduler()
+        await stop_heartbeat_scheduler()
+        await stop_timeout_scanner()
         await dispose_engine()
         await dispose_redis()
 
@@ -91,6 +126,7 @@ def create_app() -> FastAPI:
     app.include_router(jar_router)
     app.include_router(report_router)
     app.include_router(scheduled_task_router)
+    app.include_router(audit_log_router)
 
     # 报告预览静态文件服务
     reports_dir = "/root/PyProject/mysterious-data"

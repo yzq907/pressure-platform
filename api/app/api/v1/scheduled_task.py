@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_helper import record as audit_record
 from app.core.context import UserContext
 from app.core.response import PageVO, Response, success
 from app.db.session import get_db
@@ -62,9 +63,12 @@ async def update_scheduled_task(
 )
 async def delete_scheduled_task(
     id: int,
+    current: UserContext = Depends(get_current_user_dep),
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.delete_scheduled_task(db, id)
+    if ok:
+        await audit_record(db, current, "DELETE", "scheduled_task", id, detail=f"删除定时任务 #{id}")
     return success(ok)
 
 
@@ -81,6 +85,26 @@ async def toggle_scheduled_task(
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.toggle_enabled(db, id, enabled, current)
+    if ok:
+        action_name = "启用" if enabled else "禁用"
+        await audit_record(db, current, "UPDATE", "scheduled_task", id, detail=f"{action_name}定时任务 #{id}")
+    return success(ok)
+
+
+@router.get(
+    "/trigger/{id}",
+    summary="立即触发定时任务",
+    response_model=Response[bool],
+    response_model_by_alias=True,
+)
+async def trigger_scheduled_task(
+    id: int,
+    current: UserContext = Depends(get_current_user_dep),
+    db: AsyncSession = Depends(get_db),
+) -> Response[bool]:
+    ok = await service.trigger_now(db, id, current)
+    if ok:
+        await audit_record(db, current, "EXECUTE", "scheduled_task", id, detail=f"立即触发定时任务 #{id}")
     return success(ok)
 
 

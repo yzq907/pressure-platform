@@ -57,6 +57,7 @@ CREATE TABLE `mysterious_testcase` (
     `version` varchar(128) NOT NULL DEFAULT '' COMMENT '服务版本',
     `status` tinyint(4) NOT NULL DEFAULT '0' COMMENT '0-未执行，1-执行中, 2-执行成功, 3-执行异常',
     `test_case_dir` varchar(255) NOT NULL DEFAULT '' COMMENT '用例目录',
+    `timeout_seconds` smallint NOT NULL DEFAULT 7200 COMMENT '执行超时秒数',
     `creator_id` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人ID',
     `creator` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人',
     `modifier_id` varchar(32) NOT NULL DEFAULT '' COMMENT '修改人ID',

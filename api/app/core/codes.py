@@ -94,4 +94,6 @@ class Codes:
 
     SCHEDULED_TASK_NOT_EXIST = Code(1070, "定时任务不存在", False)
 
+    USER_PASSWORD_TOO_WEAK = Code(1080, "密码强度不足", False)
+
     SYSTEM_ERROR = Code(9999, "系统异常", False)

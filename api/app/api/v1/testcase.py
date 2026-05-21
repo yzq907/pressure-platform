@@ -6,6 +6,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_helper import record as audit_record
 from app.core.context import UserContext
 from app.core.response import PageVO, Response, success
 from app.db.session import get_db
@@ -67,9 +68,12 @@ async def update_testcase(
 )
 async def delete_testcase(
     id: int,
+    current: UserContext = Depends(get_current_user_dep),
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.delete_testcase(db, id)
+    if ok:
+        await audit_record(db, current, "DELETE", "testcase", id, detail=f"删除用例 #{id}")
     return success(ok)
 
 

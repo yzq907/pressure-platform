@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_helper import record as audit_record
 from app.core.context import UserContext
 from app.core.response import PageVO, Response, success
 from app.db.session import get_db
@@ -72,9 +73,12 @@ async def get_by_id(
 )
 async def delete_node(
     id: int,
+    current: UserContext = Depends(get_current_user_dep),
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.delete_node(db, id)
+    if ok:
+        await audit_record(db, current, "DELETE", "node", id, detail=f"删除节点 #{id}")
     return success(ok)
 
 
@@ -131,6 +135,8 @@ async def enable_node(
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.enable_node(db, id, current)
+    if ok:
+        await audit_record(db, current, "UPDATE", "node", id, detail=f"启用节点 #{id}")
     return success(ok)
 
 
@@ -146,4 +152,6 @@ async def disable_node(
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.disable_node(db, id, current)
+    if ok:
+        await audit_record(db, current, "UPDATE", "node", id, detail=f"禁用节点 #{id}")
     return success(ok)
