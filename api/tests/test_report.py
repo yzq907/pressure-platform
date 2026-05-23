@@ -24,6 +24,11 @@ async def _insert_report(
     exec_type: int = 1,
     status: int = 0,
     report_dir: str = "/tmp/r",
+    service_name: str = "",
+    total_threads: int = 0,
+    slave_count: int = 0,
+    grafana_instance: str = "",
+    artifact_dir: str = "",
 ) -> int:
     r = Report(
         name=name,
@@ -34,6 +39,11 @@ async def _insert_report(
         status=status,
         response_data="",
         jmeter_log_file_path=report_dir + "/jmeter.log",
+        service_name=service_name,
+        total_threads=total_threads,
+        slave_count=slave_count,
+        grafana_instance=grafana_instance,
+        artifact_dir=artifact_dir,
     )
     db.add(r)
     await db.commit()
@@ -75,11 +85,49 @@ async def test_report_list_by_test_case(auth_client: AsyncClient, db: AsyncSessi
 
 @pytest.mark.asyncio
 async def test_report_get_by_id(auth_client: AsyncClient, db: AsyncSession) -> None:
-    rid = await _insert_report(db, name="findme")
+    rid = await _insert_report(
+        db,
+        name="findme",
+        service_name="EMM-API",
+        total_threads=30,
+        slave_count=2,
+        grafana_instance="10.10.27.42:9200",
+        artifact_dir="/tmp/r/artifacts",
+    )
     resp = await auth_client.get(f"/report/getById/{rid}")
     item = resp.json()["data"]
     assert item["name"] == "findme"
     assert item["id"] == rid
+    assert item["serviceName"] == "EMM-API"
+    assert item["totalThreads"] == 30
+    assert item["slaveCount"] == 2
+    assert item["grafanaInstance"] == "10.10.27.42:9200"
+    assert item["artifactDir"] == "/tmp/r/artifacts"
+
+
+@pytest.mark.asyncio
+async def test_report_stats_counts_history_reports(
+    auth_client: AsyncClient, db: AsyncSession
+) -> None:
+    await _insert_report(db, name="stat_api_1", status=0)
+    await _insert_report(db, name="stat_api_2", status=1)
+    await _insert_report(db, name="stat_api_3", status=2)
+    await _insert_report(db, name="stat_api_4", status=2)
+    await _insert_report(db, name="stat_api_5", status=3)
+    await _insert_report(db, name="other", status=2)
+
+    resp = await auth_client.get("/report/stats?name=stat_api")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"] == {
+        "total": 5,
+        "running": 1,
+        "success": 2,
+        "failed": 1,
+        "idle": 1,
+        "successRate": 66.7,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +261,42 @@ async def test_grafana_url_uses_dashboard_template_and_service_instance(
     assert query["from"][0].isdigit()
     assert query["to"][0].isdigit()
     assert "var-region" not in query
+
+
+@pytest.mark.asyncio
+async def test_grafana_url_prefers_report_snapshot_instance(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    db.add(TestCase(id=20, name="case-2", service="EMM-CORE"))
+    db.add(
+        Config(
+            config_key="GRAFANA_DASHBOARD_URL",
+            config_value="http://10.10.27.210:3000/d/StarsL-TenSunS-node/0d50bf8?orgId=1",
+            description="grafana url",
+        )
+    )
+    db.add(
+        Config(
+            config_key="GRAFANA_INSTANCE_MAP",
+            config_value='{"EMM-CORE":"10.10.27.43:9200"}',
+            description="service instance map",
+        )
+    )
+    await db.commit()
+
+    rid = await _insert_report(
+        db,
+        name="rpt",
+        test_case_id=20,
+        exec_type=ExecType.EXEC.value,
+        service_name="EMM-API",
+        grafana_instance="10.10.27.42:9200",
+    )
+    resp = await auth_client.get(f"/report/grafana/{rid}")
+
+    query = parse_qs(urlsplit(resp.json()["data"]).query)
+    assert query["var-instance"] == ["10.10.27.42:9200"]
 
 
 def test_parse_jtl_metrics_converts_distributed_threads_to_total(tmp_path) -> None:

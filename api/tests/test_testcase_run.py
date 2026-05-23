@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import NodeStatus, NodeType, TestCaseStatus
+from app.models.config import Config
 from app.models.node import Node
 from app.models.report import Report
 from app.models.testcase import TestCase
@@ -149,6 +150,51 @@ async def test_run_no_slaves_no_R_flag(
     assert resp.json()["code"] == 0
     assert "-R" not in captured["cmd"]
     await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_run_creates_report_snapshot(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+
+    case_id = await _create_case_with_jmx(auth_client, "r_snapshot", sample_jmx_bytes)
+    tc = (await db.execute(select(TestCase).where(TestCase.id == case_id))).scalar_one()
+    tc.service = "EMM-API"
+    db.add(Config(config_key="INIT_ARTIFACT_TESTCASE_IDS", config_value=str(case_id), description="init case"))
+    db.add(Config(config_key="GRAFANA_INSTANCE_MAP", config_value='{"EMM-API":"10.10.27.42:9200"}', description="grafana"))
+    await db.commit()
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "30", "rampTime": "0", "duration": "60", "slaveCount": 1, "region": "华南"},
+    )
+    assert resp.json()["code"] == 0
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+    assert "-R" not in captured["cmd"]
+    assert any(arg.startswith("-JartifactDir=") for arg in captured["cmd"])
+    report = (
+        await db.execute(select(Report).where(Report.test_case_id == case_id))
+    ).scalars().one()
+    assert report.service_name == "EMM-API"
+    assert report.total_threads == 30
+    assert report.slave_count == 1
+    assert report.region == "华南"
+    assert report.grafana_instance == "10.10.27.42:9200"
+    assert report.artifact_dir.endswith("/artifacts")
 
 
 @pytest.mark.asyncio

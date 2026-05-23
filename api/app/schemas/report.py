@@ -22,6 +22,11 @@ class ReportParam(CamelModel):
     response_data: str | None = None
     jmeter_log_file_path: str | None = None
     region: str | None = None
+    service_name: str | None = None
+    total_threads: int | None = None
+    slave_count: int | None = None
+    grafana_instance: str | None = None
+    artifact_dir: str | None = None
 
 
 class ReportVO(BaseVO):
@@ -34,6 +39,22 @@ class ReportVO(BaseVO):
     response_data: str = ""
     jmeter_log_file_path: str = ""
     region: str = ""
+    service_name: str = ""
+    total_threads: int = 0
+    slave_count: int = 0
+    grafana_instance: str = ""
+    artifact_dir: str = ""
+
+
+class ReportStatsVO(CamelModel):
+    """历史报告状态聚合统计。"""
+
+    total: int = 0
+    running: int = 0
+    success: int = 0
+    failed: int = 0
+    idle: int = 0
+    success_rate: float = 100.0
 
 
 class ReportQuery(BaseQuery):

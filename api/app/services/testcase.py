@@ -375,6 +375,15 @@ async def debug_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:
             status=TestCaseStatus.RUN_ING.value,
             response_data="",
             jmeter_log_file_path=log_path,
+            service_name=testcase.service,
+            total_threads=1,
+            slave_count=1,
+            grafana_instance=await report_service.resolve_grafana_instance(
+                db,
+                service_name=testcase.service,
+                testcase_name=testcase.name,
+                report_name=testcase.name,
+            ),
         ),
         user,
     )
@@ -490,10 +499,11 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
     artifact_dir = str(Path(data_dir).resolve().parent / "artifacts")
     if is_init_artifact:
         Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+    actual_slave_count = max(1, slave_count)
     _write_run_meta(
         data_dir,
         total_threads=total_threads,
-        slave_count=max(1, slave_count),
+        slave_count=actual_slave_count,
         per_slave_threads=per_slave_threads,
     )
 
@@ -533,6 +543,16 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
             response_data=Codes.STRESS_RESULT.message,
             jmeter_log_file_path=log_path,
             region=region,
+            service_name=testcase.service,
+            total_threads=total_threads,
+            slave_count=actual_slave_count,
+            grafana_instance=await report_service.resolve_grafana_instance(
+                db,
+                service_name=testcase.service,
+                testcase_name=testcase.name,
+                report_name=testcase.name,
+            ),
+            artifact_dir=artifact_dir,
         ),
         user,
     )

@@ -25,7 +25,7 @@ from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
 from app.crud import report as crud, testcase as testcase_crud
 from app.models.report import Report
-from app.schemas.report import ArtifactVO, ReportByTestCaseQuery, ReportParam, ReportQuery, ReportVO
+from app.schemas.report import ArtifactVO, ReportByTestCaseQuery, ReportParam, ReportQuery, ReportStatsVO, ReportVO
 from app.services import config as config_service
 
 log = logging.getLogger(__name__)
@@ -50,6 +50,11 @@ async def add_report(db: AsyncSession, param: ReportParam, user: UserContext) ->
         response_data=param.response_data or "",
         jmeter_log_file_path=param.jmeter_log_file_path or "",
         region=param.region or "",
+        service_name=param.service_name or "",
+        total_threads=param.total_threads or 0,
+        slave_count=param.slave_count or 0,
+        grafana_instance=param.grafana_instance or "",
+        artifact_dir=param.artifact_dir or "",
     )
     stamp_create(obj, user)
     await crud.add(db, obj)
@@ -98,6 +103,22 @@ async def get_report_list_by_test_case(
     )
     page_vo.list = [_to_vo(o) for o in items]
     return page_vo
+
+
+async def get_report_stats(db: AsyncSession, query: ReportQuery) -> ReportStatsVO:
+    counts = await crud.count_by_status(db, name=query.name, region=query.region)
+    success = counts.get(2, 0)
+    failed = counts.get(3, 0)
+    executed = success + failed
+    success_rate = 100.0 if executed == 0 else round(success / executed * 100, 1)
+    return ReportStatsVO(
+        total=sum(counts.values()),
+        idle=counts.get(0, 0),
+        running=counts.get(1, 0),
+        success=success,
+        failed=failed,
+        success_rate=success_rate,
+    )
 
 
 async def get_debug_reports_by_test_case_id(
@@ -245,21 +266,39 @@ def _parse_instance_map(raw: str) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items() if k and v}
 
 
-async def _resolve_grafana_instance(db: AsyncSession, report: Report) -> str:
-    """按用例服务名解析 Grafana instance，例如 EMM-API -> 10.10.27.42:9200。"""
+async def resolve_grafana_instance(
+    db: AsyncSession,
+    service_name: str = "",
+    testcase_name: str = "",
+    report_name: str = "",
+) -> str:
+    """按服务名等候选 key 解析 Grafana instance，例如 EMM-API -> 10.10.27.42:9200。"""
     mapping = _parse_instance_map(
         await config_service.get_value_or_default(db, "GRAFANA_INSTANCE_MAP", "")
     )
-    testcase = await testcase_crud.get_by_id(db, report.test_case_id)
     candidates = [
-        testcase.service if testcase else "",
-        testcase.name if testcase else "",
-        report.name,
+        service_name,
+        testcase_name,
+        report_name,
     ]
     for key in candidates:
         if key and key in mapping:
             return mapping[key]
     return await config_service.get_value_or_default(db, "GRAFANA_DEFAULT_INSTANCE", "")
+
+
+async def _resolve_grafana_instance(db: AsyncSession, report: Report) -> str:
+    """优先使用报告快照；老报告没有快照时回退到当前用例信息。"""
+    if report.grafana_instance:
+        return report.grafana_instance
+
+    testcase = await testcase_crud.get_by_id(db, report.test_case_id)
+    return await resolve_grafana_instance(
+        db,
+        service_name=report.service_name or (testcase.service if testcase else ""),
+        testcase_name=testcase.name if testcase else "",
+        report_name=report.name,
+    )
 
 
 async def get_grafana_url(db: AsyncSession, id: int) -> str:
@@ -356,11 +395,16 @@ def _artifact_dir(report_dir: str) -> str | None:
     return os.path.join(report_root, "artifacts")
 
 
-def _safe_artifact_path(report_dir: str, name: str) -> str:
+def _report_artifact_dir(report: Report) -> str | None:
+    if report.artifact_dir:
+        return report.artifact_dir
+    return _artifact_dir(report.report_dir)
+
+
+def _safe_artifact_path(artifact_dir: str | None, name: str) -> str:
     if not name or Path(name).name != name:
         raise MysteriousException(Codes.PARAM_WRONG, message="产物文件名不合法")
 
-    artifact_dir = _artifact_dir(report_dir)
     if not artifact_dir:
         raise MysteriousException(Codes.REPORT_DIR_NOT_EXIST)
 
@@ -376,7 +420,7 @@ async def list_artifacts(db: AsyncSession, id: int) -> list[ArtifactVO]:
     if report is None:
         raise MysteriousException(Codes.REPORT_NOT_EXIST)
 
-    artifact_dir = _artifact_dir(report.report_dir)
+    artifact_dir = _report_artifact_dir(report)
     if not artifact_dir or not os.path.isdir(artifact_dir):
         return []
 
@@ -400,7 +444,7 @@ async def download_artifact(db: AsyncSession, id: int, name: str) -> str:
     if report is None:
         raise MysteriousException(Codes.REPORT_NOT_EXIST)
 
-    path = _safe_artifact_path(report.report_dir, name)
+    path = _safe_artifact_path(_report_artifact_dir(report), name)
     if not os.path.isfile(path):
         raise MysteriousException(Codes.FILE_NOT_EXIST)
     return path

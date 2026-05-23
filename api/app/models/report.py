@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Index, SmallInteger, String
+from sqlalchemy import BigInteger, Index, Integer, SmallInteger, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import ID_TYPE, AuditMixin, Base
@@ -23,5 +23,10 @@ class Report(Base, AuditMixin):
     response_data: Mapped[str] = mapped_column(String(512), default="", server_default="")
     jmeter_log_file_path: Mapped[str] = mapped_column(String(255), default="", server_default="")
     region: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    service_name: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    total_threads: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    slave_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    grafana_instance: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    artifact_dir: Mapped[str] = mapped_column(String(255), default="", server_default="")
 
     __table_args__ = (Index("idx_test_case_id_report", "test_case_id"),)

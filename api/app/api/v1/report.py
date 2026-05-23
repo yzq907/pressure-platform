@@ -18,7 +18,7 @@ from app.core.exceptions import MysteriousException
 from app.core.response import PageVO, Response, success
 from app.db.session import get_db
 from app.deps.auth import get_current_user_dep
-from app.schemas.report import ArtifactVO, CompareVO, MetricsVO, ReportByTestCaseQuery, ReportQuery, ReportVO
+from app.schemas.report import ArtifactVO, CompareVO, MetricsVO, ReportByTestCaseQuery, ReportQuery, ReportStatsVO, ReportVO
 from app.schemas.testcase import JMeterResultVO
 from app.services import report as service
 
@@ -55,6 +55,20 @@ async def get_report_list_by_test_case(
 ) -> Response[PageVO[ReportVO]]:
     page = await service.get_report_list_by_test_case(db, query)
     return success(page)
+
+
+@router.get(
+    "/stats",
+    summary="历史报告状态统计",
+    response_model=Response[ReportStatsVO],
+    response_model_by_alias=True,
+)
+async def report_stats(
+    query: ReportQuery = Depends(),
+    db: AsyncSession = Depends(get_db),
+) -> Response[ReportStatsVO]:
+    stats = await service.get_report_stats(db, query)
+    return success(stats)
 
 
 @router.get(
