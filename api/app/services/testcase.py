@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import shlex
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -64,6 +65,11 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_HOME_KEY = "MASTER_DATA_HOME"
 MASTER_JMETER_BIN_HOME_KEY = "MASTER_JMETER_BIN_HOME"
 INIT_ARTIFACT_TESTCASE_IDS_KEY = "INIT_ARTIFACT_TESTCASE_IDS"
+_REMOTE_STOP_WAIT_SECONDS = 3
+_REMOTE_RESTART_WAIT_SECONDS = 3
+_REMOTE_RESTART_ATTEMPTS = 2
+_JMETER_SERVER_PS_CMD = "ps aux | grep jmeter-server | grep -v grep"
+_JMETER_SERVER_KILL_CMD = "ps aux | grep jmeter-server | grep -v grep | awk '{print $2}' | xargs kill -9"
 
 # Java 端 addTestCase 校验：name 不能含空格或 #
 _BAD_NAME_CHARS = re.compile(r"[\s#]")
@@ -297,6 +303,7 @@ def _write_run_meta(
     total_threads: int,
     slave_count: int,
     per_slave_threads: int,
+    slave_hosts: list[str] | None = None,
 ) -> None:
     """记录本次执行的线程快照，供实时曲线把单机 JTL 线程数换算为总线程数。"""
     report_root = Path(data_dir).resolve().parent
@@ -305,6 +312,7 @@ def _write_run_meta(
         "total_threads": total_threads,
         "slave_count": slave_count,
         "per_slave_threads": per_slave_threads,
+        "slave_hosts": slave_hosts or [],
     }
     try:
         meta_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -572,6 +580,7 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
         total_threads=total_threads,
         slave_count=actual_slave_count,
         per_slave_threads=per_slave_threads,
+        slave_hosts=[f"{s.host}:1099" for s in healthy_slaves],
     )
 
     cmd = [
@@ -651,6 +660,9 @@ async def stop_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:
     for rpt in running_reports:
         ok = await jmeter_runner.launch_stop(rpt.id)
         log.info("[stop] report_id=%s region=%s ok=%s", rpt.id, rpt.region, ok)
+        remote_message = await _stop_remote_engines(db, rpt)
+        _mark_report_stopped(testcase, rpt, ok, remote_message)
+    await db.commit()
     return True
 
 
@@ -663,8 +675,136 @@ async def stop_execution(db: AsyncSession, report_id: int, user: UserContext) ->
         raise MysteriousException(Codes.TESTCASE_IS_NOT_RUNNING)
 
     log.info("[stop execution] report_id=%s region=%s", report_id, rpt.region)
-    await jmeter_runner.launch_stop(report_id)
+    stopped = await jmeter_runner.launch_stop(report_id)
+    remote_message = await _stop_remote_engines(db, rpt)
+    testcase = await crud.get_by_id(db, rpt.test_case_id)
+    _mark_report_stopped(testcase, rpt, stopped, remote_message)
+    await db.commit()
     return True
+
+
+def _mark_report_stopped(
+    testcase: TestCase | None,
+    report: ReportModel,
+    stopped: bool,
+    remote_message: str = "",
+) -> None:
+    """用户手动停止后立即落库，避免页面等待后台 JMeter 回调才退出执行队列。"""
+    if testcase is not None:
+        testcase.status = TestCaseStatus.RUN_FAILED.value
+    report.status = TestCaseStatus.RUN_FAILED.value
+    suffix = "" if stopped else "（未找到本地 JMeter 进程，已清理平台状态）"
+    report.response_data = f"用户手动停止{suffix}{remote_message}"
+
+
+async def _stop_remote_engines(db: AsyncSession, report: ReportModel) -> str:
+    """停止本次执行使用过的 slave engine；busy 时重启 jmeter-server。"""
+    slave_hosts = _load_report_slave_hosts(report.report_dir)
+    if not slave_hosts:
+        return ""
+    try:
+        slave_bin = await config_service.get_value(db, "SLAVE_JMETER_BIN_HOME")
+        slave_log = await config_service.get_value(db, "SLAVE_JMETER_LOG_HOME")
+    except Exception as e:  # noqa: BLE001
+        log.warning("停止远程 JMeter Engine 跳过: 读取 slave JMeter 配置失败 report_id=%s", report.id, exc_info=True)
+        return f"；远程压力机清理跳过: {e}"
+
+    restarted: list[str] = []
+    failed: list[str] = []
+    seen: set[str] = set()
+    for host_port in slave_hosts:
+        host = _host_from_jmeter_remote(host_port)
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        node = await node_crud.get_by_host(db, host)
+        if node is None:
+            log.warning("停止远程 JMeter Engine 跳过: 未找到压力机 host=%s report_id=%s", host, report.id)
+            failed.append(host)
+            continue
+        try:
+            did_restart = await _stop_remote_engine(node, slave_bin, slave_log)
+            if did_restart:
+                restarted.append(host)
+        except Exception:  # noqa: BLE001
+            log.warning("停止远程 JMeter Engine 失败 host=%s report_id=%s", host, report.id, exc_info=True)
+            node.health_status = 0
+            failed.append(host)
+
+    messages: list[str] = []
+    if restarted:
+        messages.append("已重启压力机: " + ",".join(restarted))
+    if failed:
+        messages.append("压力机清理失败: " + ",".join(failed))
+    return "；" + "；".join(messages) if messages else ""
+
+
+async def _stop_remote_engine(node, slave_bin: str, slave_log: str) -> bool:
+    ssh = SSHClient(node.host, node.port, node.username, node.password)
+    slave_bin = slave_bin.rstrip("/")
+    slave_log = slave_log.rstrip("/")
+    shutdown_cmd = shlex.quote(f"{slave_bin}/shutdown.sh")
+    await ssh.exec_command(shutdown_cmd)
+    if _REMOTE_STOP_WAIT_SECONDS > 0:
+        await asyncio.sleep(_REMOTE_STOP_WAIT_SECONDS)
+
+    ps_after_shutdown = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
+    if not _remote_jmeter_server_running(ps_after_shutdown):
+        return False
+
+    start_cmd = (
+        f"cd {shlex.quote(slave_log)} && "
+        f"{shlex.quote(f'{slave_bin}/jmeter-server')} -Djava.rmi.server.hostname={shlex.quote(node.host)}"
+    )
+    last_start_output = ""
+    last_ps_output = ""
+    for attempt in range(1, _REMOTE_RESTART_ATTEMPTS + 1):
+        await ssh.exec_command(_JMETER_SERVER_KILL_CMD)
+        result = await ssh.exec_command(start_cmd)
+        last_start_output = result
+        log.info("重启远程 jmeter-server host=%s attempt=%s output=%s", node.host, attempt, result)
+        if _REMOTE_RESTART_WAIT_SECONDS > 0:
+            await asyncio.sleep(_REMOTE_RESTART_WAIT_SECONDS)
+
+        ps_after_restart = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
+        last_ps_output = ps_after_restart
+        if _remote_jmeter_server_running(ps_after_restart) or _remote_jmeter_server_started(result, node.host):
+            return True
+
+    raise RuntimeError(
+        f"jmeter-server restart not verified, output={last_start_output}, ps={last_ps_output}"
+    )
+
+
+def _remote_jmeter_server_running(output: str | None) -> bool:
+    return bool(output and output != "null")
+
+
+def _remote_jmeter_server_started(output: str | None, host: str) -> bool:
+    return bool(output and (host in output or "Using local port" in output))
+
+
+def _load_report_slave_hosts(report_dir: str) -> list[str]:
+    if not report_dir:
+        return []
+    meta_path = Path(report_dir).resolve().parent / "run_meta.json"
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    hosts = data.get("slave_hosts", []) if isinstance(data, dict) else []
+    if not isinstance(hosts, list):
+        return []
+    return [str(host) for host in hosts if host]
+
+
+def _host_from_jmeter_remote(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("[") and "]" in value:
+        return value[1:value.index("]")]
+    return value.split(":", 1)[0].strip()
 
 
 async def get_full_vo(db: AsyncSession, id: int) -> TestCaseFullVO | None:

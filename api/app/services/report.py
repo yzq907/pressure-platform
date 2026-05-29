@@ -317,12 +317,12 @@ async def get_grafana_url(db: AsyncSession, id: int) -> str:
     instance_var = await config_service.get_value_or_default(db, "GRAFANA_INSTANCE_VAR", "instance")
     instance = await _resolve_grafana_instance(db, report)
     from_offset = _parse_offset_minutes(
-        await config_service.get_value_or_default(db, "GRAFANA_FROM_OFFSET_MINUTES", "5"),
-        5,
+        await config_service.get_value_or_default(db, "GRAFANA_FROM_OFFSET_MINUTES", "15"),
+        15,
     )
     to_offset = _parse_offset_minutes(
-        await config_service.get_value_or_default(db, "GRAFANA_TO_OFFSET_MINUTES", "5"),
-        5,
+        await config_service.get_value_or_default(db, "GRAFANA_TO_OFFSET_MINUTES", "15"),
+        15,
     )
 
     start = report.create_time

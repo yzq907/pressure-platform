@@ -33,6 +33,13 @@ def _now() -> datetime:
     return datetime.now(SHANGHAI)
 
 
+def _as_local_naive(dt: datetime) -> datetime:
+    """统一转成上海时区 naive datetime，避免 aware/naive 比较异常。"""
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(SHANGHAI).replace(tzinfo=None)
+
+
 async def _scan_and_timeout(db: AsyncSession) -> int:
     """执行一轮超时扫描，返回被超时终止的报告数量。"""
     stmt = (
@@ -47,7 +54,7 @@ async def _scan_and_timeout(db: AsyncSession) -> int:
         return 0
 
     timed_out_count = 0
-    now = _now()
+    now = _as_local_naive(_now())
 
     for rpt, tc in rows:
         # 取 testcase 的 timeout_seconds，兜底 7200
@@ -56,11 +63,7 @@ async def _scan_and_timeout(db: AsyncSession) -> int:
         create_time = rpt.create_time
         if create_time is None:
             continue
-        # 兼容带 tz 和不带 tz 的情况
-        if create_time.tzinfo is None:
-            deadline = create_time + timedelta(seconds=timeout_sec)
-        else:
-            deadline = create_time.astimezone(SHANGHAI).replace(tzinfo=None) + timedelta(seconds=timeout_sec)
+        deadline = _as_local_naive(create_time) + timedelta(seconds=timeout_sec)
 
         if now < deadline:
             continue

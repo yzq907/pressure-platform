@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -297,6 +298,34 @@ async def test_grafana_url_prefers_report_snapshot_instance(
 
     query = parse_qs(urlsplit(resp.json()["data"]).query)
     assert query["var-instance"] == ["10.10.27.42:9200"]
+
+
+@pytest.mark.asyncio
+async def test_grafana_url_defaults_to_15_minute_execution_window_padding(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    db.add(
+        Config(
+            config_key="GRAFANA_DASHBOARD_URL",
+            config_value="http://10.10.27.210:3000/d/StarsL-TenSunS-node/0d50bf8?orgId=1",
+            description="grafana url",
+        )
+    )
+    await db.commit()
+
+    rid = await _insert_report(db, name="rpt", exec_type=ExecType.EXEC.value)
+    report = await db.get(Report, rid)
+    assert report is not None
+    report.create_time = datetime(2026, 5, 27, 10, 0, 0)
+    report.modify_time = datetime(2026, 5, 27, 10, 30, 0)
+    await db.commit()
+
+    resp = await auth_client.get(f"/report/grafana/{rid}")
+
+    query = parse_qs(urlsplit(resp.json()["data"]).query)
+    assert query["from"] == ["1779846300000"]
+    assert query["to"] == ["1779849900000"]
 
 
 def test_parse_jtl_metrics_converts_distributed_threads_to_total(tmp_path) -> None:
