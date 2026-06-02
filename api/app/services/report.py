@@ -10,30 +10,50 @@ import logging
 import os
 import shutil
 import zipfile
+import asyncio
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import delete as sql_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import stamp_create, stamp_modify
 from app.core.codes import Codes
 from app.core.context import UserContext
-from app.core.enums import ExecType
+from app.core.enums import ExecType, TestCaseStatus
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
 from app.crud import report as crud, testcase as testcase_crud
+from app.db import session as session_module
 from app.models.report import Report
+from app.models.report_metric_snapshot import ReportMetricSnapshot
 from app.schemas.report import ArtifactVO, ReportByTestCaseQuery, ReportParam, ReportQuery, ReportStatsVO, ReportVO
 from app.services import config as config_service
 
 log = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+DEFAULT_METRIC_WINDOWS = (5,)
+_metric_snapshot_tasks: set[tuple[int, tuple[int, ...]]] = set()
+_METRIC_RUNNING_REFRESH_INTERVAL_SECONDS = 10.0
+_metric_snapshot_last_refresh: dict[tuple[int, int], float] = {}
 
 
-def _to_vo(obj: Report) -> ReportVO:
-    return ReportVO.model_validate(obj)
+def _to_vo(obj: Report, occupied_node_hosts: list[str] | None = None) -> ReportVO:
+    vo = ReportVO.model_validate(obj)
+    vo.occupied_node_hosts = occupied_node_hosts or []
+    return vo
+
+
+async def _to_vo_list_with_occupied_nodes(db: AsyncSession, items: list[Report]) -> list[ReportVO]:
+    from app.services import execution_node
+
+    host_map = await execution_node.active_hosts_by_report_ids(db, [item.id for item in items])
+    return [_to_vo(item, host_map.get(item.id, [])) for item in items]
 
 
 async def add_report(db: AsyncSession, param: ReportParam, user: UserContext) -> int:
@@ -74,7 +94,9 @@ async def update_report(db: AsyncSession, obj: Report, user: UserContext | None)
 
 async def get_by_id(db: AsyncSession, id: int) -> ReportVO | None:
     obj = await crud.get_by_id(db, id)
-    return _to_vo(obj) if obj else None
+    if obj is None:
+        return None
+    return (await _to_vo_list_with_occupied_nodes(db, [obj]))[0]
 
 
 async def get_report_list(db: AsyncSession, query: ReportQuery) -> PageVO[ReportVO]:
@@ -85,7 +107,7 @@ async def get_report_list(db: AsyncSession, query: ReportQuery) -> PageVO[Report
     page_vo.total = total
     offset = PageVO.offset(query.page, query.size)
     items = await crud.list_reports(db, name=query.name, region=query.region, offset=offset, limit=query.size)
-    page_vo.list = [_to_vo(o) for o in items]
+    page_vo.list = await _to_vo_list_with_occupied_nodes(db, items)
     return page_vo
 
 
@@ -101,7 +123,7 @@ async def get_report_list_by_test_case(
     items = await crud.list_by_test_case(
         db, name=query.name, test_case_id=query.test_case_id, offset=offset, limit=query.size
     )
-    page_vo.list = [_to_vo(o) for o in items]
+    page_vo.list = await _to_vo_list_with_occupied_nodes(db, items)
     return page_vo
 
 
@@ -140,6 +162,7 @@ async def clean_report(db: AsyncSession, id: int) -> bool:
         raise MysteriousException(Codes.REPORT_NOT_EXIST)
 
     log.info("清理测试报告, id: %s", id)
+    await db.execute(sql_delete(ReportMetricSnapshot).where(ReportMetricSnapshot.report_id == id))
     await crud.delete(db, id)
 
     report_dir = report.report_dir or ""
@@ -561,30 +584,225 @@ def _parse_jtl_metrics(
             active_threads = min(active_threads, total_threads)
         results.append(
             {
+                "bucket_start_ms": key,
                 "timestamp": dt.strftime("%H:%M:%S"),
                 "qps": round(count / window_sec, 1),
                 "avg_rt": round(sum(elapsed_sorted) / count, 1),
+                "p95_rt": round(_percentile(elapsed_sorted, 95), 1),
                 "p99_rt": round(_percentile(elapsed_sorted, 99), 1),
                 "error_rate": round(b["fail"] / count * 100, 2),
                 "threads": active_threads,
+                "sample_count": count,
+                "fail_count": b["fail"],
             }
         )
+    tps_peak = max((item["qps"] for item in results), default=0.0)
+    for item in results:
+        item["tps_peak"] = tps_peak
     return results
+
+
+def _snapshot_to_metric(row: ReportMetricSnapshot) -> dict:
+    return {
+        "bucket_start_ms": row.bucket_start_ms,
+        "timestamp": row.timestamp,
+        "qps": row.qps,
+        "avg_rt": row.avg_rt,
+        "p95_rt": row.p95_rt,
+        "p99_rt": row.p99_rt,
+        "error_rate": row.error_rate,
+        "threads": row.threads,
+        "sample_count": row.sample_count,
+        "fail_count": row.fail_count,
+        "tps_peak": row.tps_peak,
+    }
+
+
+async def _list_metric_snapshots(
+    db: AsyncSession,
+    report_id: int,
+    window_sec: int,
+) -> list[dict]:
+    stmt = (
+        select(ReportMetricSnapshot)
+        .where(
+            ReportMetricSnapshot.report_id == report_id,
+            ReportMetricSnapshot.window_sec == window_sec,
+        )
+        .order_by(ReportMetricSnapshot.bucket_start_ms.asc())
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    return [_snapshot_to_metric(row) for row in rows]
+
+
+async def _save_metric_snapshots(
+    db: AsyncSession,
+    report_id: int,
+    window_sec: int,
+    metrics: list[dict],
+) -> None:
+    now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    for item in metrics:
+        values = {
+            "report_id": report_id,
+            "window_sec": window_sec,
+            "bucket_start_ms": int(item.get("bucket_start_ms") or 0),
+            "timestamp": str(item.get("timestamp") or ""),
+            "qps": float(item.get("qps") or 0),
+            "avg_rt": float(item.get("avg_rt") or 0),
+            "p95_rt": float(item.get("p95_rt") or 0),
+            "p99_rt": float(item.get("p99_rt") or 0),
+            "error_rate": float(item.get("error_rate") or 0),
+            "threads": int(item.get("threads") or 0),
+            "sample_count": int(item.get("sample_count") or 0),
+            "fail_count": int(item.get("fail_count") or 0),
+            "tps_peak": float(item.get("tps_peak") or 0),
+            "creator": "system",
+            "creator_id": "0",
+            "modifier": "system",
+            "modifier_id": "0",
+            "create_time": now,
+            "modify_time": now,
+        }
+        await db.execute(_metric_snapshot_upsert_stmt(db, values))
+    await db.commit()
+
+
+def _metric_snapshot_upsert_stmt(db: AsyncSession, values: dict):
+    update_values = {
+        "timestamp": values["timestamp"],
+        "qps": values["qps"],
+        "avg_rt": values["avg_rt"],
+        "p95_rt": values["p95_rt"],
+        "p99_rt": values["p99_rt"],
+        "error_rate": values["error_rate"],
+        "threads": values["threads"],
+        "sample_count": values["sample_count"],
+        "fail_count": values["fail_count"],
+        "tps_peak": values["tps_peak"],
+        "modifier": values["modifier"],
+        "modifier_id": values["modifier_id"],
+        "modify_time": values["modify_time"],
+    }
+    dialect = db.get_bind().dialect.name
+    if dialect == "mysql":
+        stmt = mysql_insert(ReportMetricSnapshot).values(**values)
+        return stmt.on_duplicate_key_update(**update_values)
+    if dialect == "sqlite":
+        stmt = sqlite_insert(ReportMetricSnapshot).values(**values)
+        return stmt.on_conflict_do_update(
+            index_elements=["report_id", "window_sec", "bucket_start_ms"],
+            set_=update_values,
+        )
+
+    return ReportMetricSnapshot.__table__.insert().values(**values)
+
+
+async def generate_metric_snapshots_for_report(
+    db: AsyncSession,
+    report_id: int,
+    windows: tuple[int, ...] = DEFAULT_METRIC_WINDOWS,
+) -> int:
+    rpt = await crud.get_by_id(db, report_id)
+    if rpt is None:
+        raise MysteriousException(Codes.REPORT_NOT_EXIST)
+    jtl_path = _find_jtl_file(rpt.report_dir)
+    if not jtl_path:
+        return 0
+
+    total = 0
+    run_meta = _load_run_meta(rpt.report_dir)
+    for window_sec in windows:
+        metrics = await asyncio.to_thread(_parse_jtl_metrics, jtl_path, window_sec, run_meta)
+        await _save_metric_snapshots(db, report_id, window_sec, metrics)
+        total += len(metrics)
+    return total
+
+
+def schedule_metric_snapshot_generation(
+    report_id: int,
+    windows: tuple[int, ...] = DEFAULT_METRIC_WINDOWS,
+) -> bool:
+    """后台生成报告指标快照。
+
+    请求曲线接口时只查快照表；如果快照缺失，用这个函数异步补算，避免大 JTL
+    在接口请求路径里同步解析。
+    """
+    normalized_windows = tuple(sorted({int(w) for w in windows if int(w) > 0}))
+    if not normalized_windows:
+        return False
+    key = (report_id, normalized_windows)
+    if key in _metric_snapshot_tasks:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    _metric_snapshot_tasks.add(key)
+    task = loop.create_task(
+        _generate_metric_snapshots_background(report_id, normalized_windows, key),
+        name=f"report-metric-snapshot-{report_id}",
+    )
+    task.add_done_callback(lambda done_task: _on_metric_snapshot_task_done(report_id, key, done_task))
+    return True
+
+
+def _maybe_refresh_running_metric_snapshot(rpt: Report, window_sec: int) -> None:
+    if rpt.status != TestCaseStatus.RUN_ING.value:
+        return
+    key = (rpt.id, window_sec)
+    now = time.monotonic()
+    last_refresh = _metric_snapshot_last_refresh.get(key, 0.0)
+    if now - last_refresh < _METRIC_RUNNING_REFRESH_INTERVAL_SECONDS:
+        return
+    _metric_snapshot_last_refresh[key] = now
+    schedule_metric_snapshot_generation(rpt.id, (window_sec,))
+
+
+async def _generate_metric_snapshots_background(
+    report_id: int,
+    windows: tuple[int, ...],
+    key: tuple[int, tuple[int, ...]],
+) -> None:
+    async with session_module.AsyncSessionLocal() as db:
+        count = await generate_metric_snapshots_for_report(db, report_id, windows)
+    log.info("报告指标快照生成完成: report_id=%s windows=%s rows=%s", report_id, windows, count)
+
+
+def _on_metric_snapshot_task_done(
+    report_id: int,
+    key: tuple[int, tuple[int, ...]],
+    task: asyncio.Task,
+) -> None:
+    _metric_snapshot_tasks.discard(key)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        log.warning("报告指标快照生成任务被取消: report_id=%s", report_id)
+        return
+    if exc is not None:
+        log.warning("报告指标快照生成失败: report_id=%s", report_id, exc_info=(type(exc), exc, exc.__traceback__))
 
 
 async def get_jtl_metrics(
     db: AsyncSession, report_id: int, window_sec: int = 5
 ) -> list[dict]:
-    """读取指定报告 JTL 文件，按窗口聚合返回监控指标。"""
+    """读取指定报告指标快照。缺快照时触发后台补算，不在请求路径解析 JTL。"""
     rpt = await crud.get_by_id(db, report_id)
     if rpt is None:
         raise MysteriousException(Codes.REPORT_NOT_EXIST)
 
-    jtl_path = _find_jtl_file(rpt.report_dir)
-    if not jtl_path:
-        return []
+    snapshots = await _list_metric_snapshots(db, report_id, window_sec)
+    if snapshots:
+        _maybe_refresh_running_metric_snapshot(rpt, window_sec)
+        return snapshots
 
-    return _parse_jtl_metrics(jtl_path, window_sec, _load_run_meta(rpt.report_dir))
+    if rpt.status == TestCaseStatus.RUN_ING.value:
+        await generate_metric_snapshots_for_report(db, report_id, (window_sec,))
+        return await _list_metric_snapshots(db, report_id, window_sec)
+
+    schedule_metric_snapshot_generation(report_id, (window_sec,))
+    return []
 
 
 def _normalize_to_relative(items: list[dict]) -> list[dict]:

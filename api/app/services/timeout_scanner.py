@@ -18,7 +18,7 @@ from app.core.enums import TestCaseStatus
 from app.db.session import AsyncSessionLocal
 from app.models.report import Report
 from app.models.testcase import TestCase
-from app.services import jmeter_runner
+from app.services import execution_node, jmeter_runner
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 log = logging.getLogger(__name__)
@@ -82,6 +82,7 @@ async def _scan_and_timeout(db: AsyncSession) -> int:
         tc.status = TestCaseStatus.RUN_FAILED.value
         rpt.status = TestCaseStatus.RUN_FAILED.value
         rpt.response_data = f"执行超时（超过 {timeout_sec} 秒），已被系统自动终止"
+        await execution_node.release_by_report(db, rpt.id, message="执行超时，系统自动释放压力机租约")
         await db.commit()
         timed_out_count += 1
 

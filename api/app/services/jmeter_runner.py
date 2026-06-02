@@ -18,15 +18,18 @@ import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import time
 from asyncio.subprocess import PIPE, Process
+from datetime import datetime
 
 from lxml import etree
 from sqlalchemy import select
 
 from app.core.enums import ExecType, TestCaseStatus
 from app.db import session as session_module
+from app.models.execution_run import ExecutionRun
 from app.models.report import Report
 from app.models.testcase import TestCase
 
@@ -43,6 +46,13 @@ _RUN_ERROR_RE = re.compile(r".*Error.*Exception")
 _LOG_BEANSHELL_RE = re.compile(r".*Error invoking bsh method|.*NoClassDefFoundError")
 _STOP_GRACE_SECONDS = 3.0
 _KILL_GRACE_SECONDS = 2.0
+_HEARTBEAT_INTERVAL_SECONDS = 5.0
+_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+_ACTIVE_RUN_STATUSES = ("preparing", "running", "stopping")
+
+
+def _now() -> datetime:
+    return datetime.now()
 
 
 def _check_output_failed(out: str) -> bool:
@@ -107,6 +117,23 @@ async def launch_jmeter(
 
     返回 asyncio.Task；调用方通常忽略。测试用 `wait_for_completion(report_id)` 同步等待。
     """
+    try:
+        await _create_execution_run(
+            cmd,
+            testcase_id=testcase_id,
+            report_id=report_id,
+            jtl_path=jtl_path,
+            log_file_path=log_file_path,
+        )
+    except Exception:
+        log.exception("JMeter 执行记录创建失败，取消启动: report_id=%s testcase_id=%s", report_id, testcase_id)
+        await _safe_update_testcase_and_report(
+            testcase_id,
+            report_id,
+            TestCaseStatus.RUN_FAILED,
+            "执行记录创建失败，JMeter 未启动",
+        )
+        raise
     if report_id in _running_tasks:
         log.warning("JMeter 后台任务已存在，将覆盖登记: report_id=%s", report_id)
     task = asyncio.create_task(
@@ -124,6 +151,122 @@ async def launch_jmeter(
         jtl_path,
     )
     return task
+
+
+async def _create_execution_run(
+    cmd: list[str],
+    *,
+    testcase_id: int,
+    report_id: int,
+    jtl_path: str | None,
+    log_file_path: str,
+) -> None:
+    async with session_module.AsyncSessionLocal() as db:
+        rpt = await db.get(Report, report_id)
+        existing = (
+            await db.execute(select(ExecutionRun).where(ExecutionRun.report_id == report_id))
+        ).scalar_one_or_none()
+        run = existing or ExecutionRun(report_id=report_id)
+        run.test_case_id = testcase_id
+        run.region = rpt.region if rpt is not None else ""
+        run.status = "preparing"
+        run.worker_id = _WORKER_ID
+        run.pid = 0
+        run.pgid = 0
+        run.cmd = " ".join(cmd)
+        run.jtl_path = jtl_path or ""
+        run.log_path = log_file_path
+        run.heartbeat_at = _now()
+        run.started_at = None
+        run.finished_at = None
+        run.stop_requested_at = None
+        run.exit_code = 0
+        run.message = "JMeter 子进程准备启动"
+        if existing is None:
+            db.add(run)
+        await db.commit()
+
+
+async def _mark_execution_run_running(report_id: int, proc: Process) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = 0
+    await _update_execution_run(
+        report_id,
+        status="running",
+        pid=proc.pid,
+        pgid=pgid,
+        heartbeat_at=_now(),
+        started_at=_now(),
+        message="JMeter 子进程已启动",
+    )
+
+
+async def _mark_execution_run_finished(
+    report_id: int,
+    *,
+    status: str,
+    exit_code: int,
+    message: str,
+) -> None:
+    await _update_execution_run(
+        report_id,
+        status=status,
+        exit_code=exit_code,
+        heartbeat_at=_now(),
+        finished_at=_now(),
+        message=message,
+    )
+
+
+async def _release_execution_node_leases(report_id: int, message: str) -> None:
+    try:
+        from app.services import execution_node
+
+        async with session_module.AsyncSessionLocal() as db:
+            await execution_node.release_by_report(db, report_id, message=message)
+    except Exception:
+        log.exception("执行节点租约释放失败: report_id=%s", report_id)
+
+
+async def _mark_execution_run_stopping(report_id: int, message: str) -> None:
+    await _update_execution_run(
+        report_id,
+        status="stopping",
+        stop_requested_at=_now(),
+        heartbeat_at=_now(),
+        message=message,
+    )
+
+
+async def _heartbeat_execution_run(report_id: int) -> None:
+    while True:
+        await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+        await _update_execution_run(report_id, heartbeat_at=_now())
+
+
+async def _execution_run_status(report_id: int) -> str:
+    async with session_module.AsyncSessionLocal() as db:
+        run = (
+            await db.execute(select(ExecutionRun).where(ExecutionRun.report_id == report_id))
+        ).scalar_one_or_none()
+        return run.status if run is not None else ""
+
+
+async def _update_execution_run(report_id: int, **values) -> None:
+    try:
+        async with session_module.AsyncSessionLocal() as db:
+            run = (
+                await db.execute(select(ExecutionRun).where(ExecutionRun.report_id == report_id))
+            ).scalar_one_or_none()
+            if run is None:
+                return
+            for key, value in values.items():
+                setattr(run, key, value)
+            await db.commit()
+    except Exception:
+        log.exception("执行记录更新失败: report_id=%s values=%s", report_id, sorted(values))
 
 
 def _on_jmeter_task_done(report_id: int, task: asyncio.Task) -> None:
@@ -148,6 +291,7 @@ async def launch_stop(report_id: int) -> bool:
 
     返回 True 表示找到了进程并 kill；False 表示未找到（已结束或从未启动）。
     """
+    await _mark_execution_run_stopping(report_id, "收到停止请求")
     stopped = False
     proc = _running_processes.get(report_id)
     if proc is None:
@@ -155,8 +299,116 @@ async def launch_stop(report_id: int) -> bool:
     else:
         stopped = await _terminate_process_group(proc, report_id)
 
+    recorded_stopped = await _terminate_recorded_execution_process(report_id)
     orphan_stopped = await _terminate_orphan_jmeter_processes(report_id)
-    return stopped or orphan_stopped
+    return stopped or recorded_stopped or orphan_stopped
+
+
+async def _terminate_recorded_execution_process(report_id: int) -> bool:
+    """Use persisted pid/pgid to stop a run after in-memory process handles are lost."""
+    async with session_module.AsyncSessionLocal() as db:
+        run = (
+            await db.execute(
+                select(ExecutionRun).where(
+                    ExecutionRun.report_id == report_id,
+                    ExecutionRun.status.in_(_ACTIVE_RUN_STATUSES),
+                )
+            )
+        ).scalar_one_or_none()
+        if run is None:
+            return False
+        pid = run.pid
+        pgid = run.pgid
+        rpt = await db.get(Report, report_id)
+        markers = _execution_run_markers(run, rpt)
+
+    if pid <= 0 and pgid <= 0:
+        return False
+    if not _recorded_process_matches_markers(pid, markers):
+        log.warning(
+            "stop: report_id=%s 跳过执行记录进程停止，当前 pid 命令行与报告标识不匹配 pid=%s pgid=%s markers=%s",
+            report_id,
+            pid,
+            pgid,
+            markers,
+        )
+        return False
+
+    current_pgid = os.getpgrp()
+    try:
+        if pgid > 0 and pgid != current_pgid:
+            os.killpg(pgid, signal.SIGTERM)
+        elif pid > 0:
+            os.kill(pid, signal.SIGTERM)
+        else:
+            return False
+    except ProcessLookupError:
+        return True
+    except OSError:
+        log.exception("stop: report_id=%s 停止执行记录进程失败 pid=%s pgid=%s", report_id, pid, pgid)
+        return False
+
+    deadline = time.monotonic() + _STOP_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if pid <= 0 or not _pid_exists(pid):
+            return True
+        await asyncio.sleep(0.1)
+
+    try:
+        if pgid > 0 and pgid != current_pgid:
+            os.killpg(pgid, signal.SIGKILL)
+        elif pid > 0:
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        log.exception("stop: report_id=%s 强制停止执行记录进程失败 pid=%s pgid=%s", report_id, pid, pgid)
+        return False
+    return True
+
+
+def _execution_run_markers(run: ExecutionRun, rpt: Report | None) -> list[str]:
+    candidates = [
+        run.log_path,
+        run.jtl_path,
+        rpt.jmeter_log_file_path if rpt is not None else "",
+        rpt.report_dir if rpt is not None else "",
+    ]
+    markers: list[str] = []
+    for marker in candidates:
+        if marker and marker not in markers:
+            markers.append(marker)
+    return markers
+
+
+def _recorded_process_matches_markers(pid: int, markers: list[str]) -> bool:
+    if pid <= 0 or not markers:
+        return False
+    cmdline = _read_process_cmdline(pid)
+    if not cmdline:
+        return False
+    return any(marker in cmdline for marker in markers)
+
+
+def _read_process_cmdline(pid: int) -> str:
+    proc_cmdline = f"/proc/{pid}/cmdline"
+    try:
+        with open(proc_cmdline, "rb") as f:
+            data = f.read()
+        return data.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+    except OSError:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    return result.stdout.strip()
 
 
 async def _terminate_process_group(proc: Process, report_id: int) -> bool:
@@ -303,6 +555,7 @@ async def _run_and_callback(
     err_str = ""
     exit_code = -1
     proc = None
+    heartbeat_task: asyncio.Task | None = None
     started_at = time.monotonic()
     try:
         log.info(
@@ -319,6 +572,11 @@ async def _run_and_callback(
             start_new_session=True,
         )
         _running_processes[report_id] = proc
+        await _mark_execution_run_running(report_id, proc)
+        heartbeat_task = asyncio.create_task(
+            _heartbeat_execution_run(report_id),
+            name=f"jmeter-heartbeat-{report_id}",
+        )
         log.info(
             "JMeter 进程已启动: report_id=%s testcase_id=%s pid=%s log=%s jtl=%s",
             report_id,
@@ -348,9 +606,29 @@ async def _run_and_callback(
             testcase_id,
             cmd,
         )
+        await _mark_execution_run_finished(
+            report_id,
+            status="failed",
+            exit_code=exit_code,
+            message="JMeter 启动或执行异常",
+        )
         await _safe_update_testcase_and_report(testcase_id, report_id, TestCaseStatus.RUN_FAILED, None)
+        await _release_execution_node_leases(report_id, "JMeter 启动或执行异常")
         _running_processes.pop(report_id, None)
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
         return
+    finally:
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
     # proc.kill() 会导致进程被杀→ returncode < 0，视为失败
     if exit_code < 0:
@@ -379,8 +657,28 @@ async def _run_and_callback(
         output_failed,
         final_status.value,
     )
-    await _safe_update_testcase_and_report(testcase_id, report_id, final_status, response_data)
+    updated = await _safe_update_testcase_and_report(testcase_id, report_id, final_status, response_data)
+    run_status = "success" if final_status == TestCaseStatus.RUN_SUCCESS else "failed"
+    run_message = "JMeter 执行完成" if run_status == "success" else "JMeter 执行失败"
+    if await _execution_run_status(report_id) == "stopping":
+        run_status = "failed"
+        run_message = "JMeter 已按停止请求退出"
+    await _mark_execution_run_finished(
+        report_id,
+        status=run_status,
+        exit_code=exit_code,
+        message=run_message,
+    )
+    await _release_execution_node_leases(report_id, run_message)
+    if updated and exec_type == ExecType.EXEC.value:
+        _schedule_metric_snapshot(report_id)
     _running_processes.pop(report_id, None)
+
+
+def _schedule_metric_snapshot(report_id: int) -> None:
+    from app.services import report as report_service
+
+    report_service.schedule_metric_snapshot_generation(report_id)
 
 
 def _tail_for_log(value: str, limit: int = _LOG_TAIL_LIMIT) -> str:
@@ -442,4 +740,7 @@ async def _update_testcase_and_report(
             rpt.status = status.value
             if response_data is not None:
                 rpt.response_data = response_data
+            from app.services import execution_queue
+
+            await execution_queue.sync_report_status(db, report_id, status)
         await db.commit()

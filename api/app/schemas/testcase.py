@@ -39,6 +39,7 @@ class TestCaseVO(BaseVO):
 class TestCaseQuery(BaseQuery):
     id: int | None = None
     name: str | None = None
+    description: str | None = None
     biz: str | None = None
     service: str | None = None
 
@@ -80,6 +81,7 @@ class RunParam(CamelModel):
     duration: str = "60"
     slave_count: int = 1  # 期望使用的 slave 数量，默认 1
     region: str = ""  # 目标区域，为空则不限区域
+    queue_policy: str = "fail_fast"  # fail_fast / queue_when_no_slave
     thread_group_overrides: list["ThreadGroupRunOverride"] = Field(default_factory=list)
 
 

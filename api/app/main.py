@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -28,19 +29,45 @@ from app.core.config import get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
 from app.db.redis import dispose_redis
-from app.db.session import AsyncSessionLocal, dispose_engine
+from app.db import session as session_module
+from app.db.session import dispose_engine
 
 setup_logging()
 log = logging.getLogger(__name__)
 
 
 async def _recover_stuck_tasks() -> None:
-    """启动自愈：systemd restart 会清理整个 cgroup 的 jmeter 子进程，
-    但 DB 中的 RUN_ING 状态可能残留，启动时统一重置为 FAILED。"""
+    """启动自愈：先停止可能残留的 JMeter 进程，再修复 DB 中的运行态。"""
     from app.core.enums import TestCaseStatus
+    from app.models.execution_queue import ExecutionQueue
+    from app.models.execution_run import ExecutionRun
     from app.crud import report as report_crud, testcase as testcase_crud
+    from app.services import execution_node, jmeter_runner
+    from sqlalchemy import select
 
-    async with AsyncSessionLocal() as db:
+    async with session_module.AsyncSessionLocal() as db:
+        running_reports = await report_crud.has_any_running(db)
+        running_report_ids = {rpt.id for rpt in running_reports}
+        active_run_report_ids = set(
+            (
+                await db.execute(
+                    select(ExecutionRun.report_id).where(
+                        ExecutionRun.status.in_(("preparing", "running", "stopping"))
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    for report_id in sorted(running_report_ids | active_run_report_ids):
+        try:
+            stopped = await jmeter_runner.launch_stop(report_id)
+            log.info("启动自愈停止残留执行: report_id=%s stopped=%s", report_id, stopped)
+        except Exception:
+            log.exception("启动自愈停止残留执行失败: report_id=%s", report_id)
+
+    async with session_module.AsyncSessionLocal() as db:
         stuck_reports = await report_crud.has_any_running(db)
         for rpt in stuck_reports:
             rpt.status = TestCaseStatus.RUN_FAILED.value
@@ -50,12 +77,43 @@ async def _recover_stuck_tasks() -> None:
         for tc in stuck_tcs:
             tc.status = TestCaseStatus.RUN_FAILED.value
 
+        stuck_queues = list(
+            (
+                await db.execute(
+                    select(ExecutionQueue).where(ExecutionQueue.status.in_(("running", "canceling")))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for queue in stuck_queues:
+            queue.status = "failed"
+            queue.message = "Master 重启，执行队列任务被终止"
+
+        stuck_runs = list(
+            (
+                await db.execute(
+                    select(ExecutionRun).where(ExecutionRun.status.in_(("preparing", "running", "stopping")))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for run in stuck_runs:
+            run.status = "lost"
+            run.finished_at = datetime.now()
+            run.message = "Master 重启，执行进程状态丢失"
+
         await db.commit()
-        if stuck_reports or stuck_tcs:
+        lost_leases = await execution_node.mark_active_lost(db, "Master 重启，压力机租约状态丢失")
+        if stuck_reports or stuck_tcs or stuck_queues or stuck_runs:
             log.info(
-                "启动自愈完成：修复 %d 条报告，%d 条用例",
+                "启动自愈完成：修复 %d 条报告，%d 条用例，%d 条队列，%d 条执行记录，%d 条节点租约",
                 len(stuck_reports),
                 len(stuck_tcs),
+                len(stuck_queues),
+                len(stuck_runs),
+                lost_leases,
             )
 
 
@@ -67,6 +125,10 @@ async def lifespan(app: FastAPI):
     from app.db.schema import (
         ensure_ai_generation_tables,
         ensure_csv_distribution_columns,
+        ensure_execution_node_table,
+        ensure_execution_queue_table,
+        ensure_execution_run_table,
+        ensure_report_metric_snapshot_table,
         ensure_rbac_schema,
         ensure_report_snapshot_columns,
         ensure_scheduled_task_log_table,
@@ -76,9 +138,13 @@ async def lifespan(app: FastAPI):
     await ensure_csv_distribution_columns()
     await ensure_rbac_schema()
     await ensure_scheduled_task_log_table()
+    await ensure_execution_queue_table()
+    await ensure_execution_run_table()
+    await ensure_execution_node_table()
+    await ensure_report_metric_snapshot_table()
 
     # 初始化：创建 admin 用户（如不存在）
-    async with AsyncSessionLocal() as db:
+    async with session_module.AsyncSessionLocal() as db:
         from app.services.user import ensure_admin_user
         await ensure_admin_user(db)
 
@@ -91,10 +157,12 @@ async def lifespan(app: FastAPI):
         from app.services.report_cleanup import start_cleanup_scheduler, stop_cleanup_scheduler
         from app.services.node_heartbeat import start_heartbeat_scheduler, stop_heartbeat_scheduler
         from app.services.timeout_scanner import start_timeout_scanner, stop_timeout_scanner
+        from app.services.execution_queue import start_execution_queue_dispatcher, stop_execution_queue_dispatcher
         start_scheduler(poll_interval=60)
         start_cleanup_scheduler()
         start_heartbeat_scheduler()
         start_timeout_scanner()
+        start_execution_queue_dispatcher()
         yield
     finally:
         log.info("Mysterious API shutting down")
@@ -102,6 +170,7 @@ async def lifespan(app: FastAPI):
         await stop_cleanup_scheduler()
         await stop_heartbeat_scheduler()
         await stop_timeout_scanner()
+        await stop_execution_queue_dispatcher()
         await dispose_engine()
         await dispose_redis()
 

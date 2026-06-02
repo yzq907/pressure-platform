@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import NodeStatus, NodeType
+from app.models.execution_node import ExecutionNode
 from app.models.node import Node
 
 
@@ -172,6 +173,50 @@ async def test_enable_slave_count_region_matches_exact_token(
     await db.commit()
 
     resp = await auth_client.get("/node/enableSlaveCount?region=长沙")
+    assert resp.json()["data"] == 1
+
+
+@pytest.mark.asyncio
+async def test_enable_slave_count_excludes_leased_slave(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    node1 = Node(
+        name="busy",
+        type=NodeType.SLAVE.value,
+        host="10.0.6.1",
+        username="u",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+        region="华东",
+    )
+    node2 = Node(
+        name="idle",
+        type=NodeType.SLAVE.value,
+        host="10.0.6.2",
+        username="u",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+        region="华东",
+    )
+    db.add_all([node1, node2])
+    await db.commit()
+    await db.refresh(node1)
+    db.add(
+        ExecutionNode(
+            report_id=1001,
+            test_case_id=2001,
+            node_id=node1.id,
+            node_host=node1.host,
+            region="华东",
+            status="leased",
+        )
+    )
+    await db.commit()
+
+    resp = await auth_client.get("/node/enableSlaveCount?region=华东")
     assert resp.json()["data"] == 1
 
 

@@ -248,3 +248,206 @@ async def ensure_scheduled_task_log_table() -> None:
             await conn.execute(text("CREATE INDEX idx_scheduled_task_log_task_id ON mysterious_scheduled_task_log (scheduled_task_id)"))
             await conn.execute(text("CREATE INDEX idx_scheduled_task_log_test_case_id ON mysterious_scheduled_task_log (test_case_id)"))
         log.info("已创建 mysterious_scheduled_task_log 表")
+
+
+async def ensure_execution_queue_table() -> None:
+    """Create manual execution queue table for upgraded deployments."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        if "mysterious_execution_queue" in tables:
+            return
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+        ddl = f"""
+        CREATE TABLE mysterious_execution_queue (
+            id {id_type},
+            test_case_id bigint NOT NULL DEFAULT 0,
+            report_id bigint NOT NULL DEFAULT 0,
+            status varchar(32) NOT NULL DEFAULT 'pending',
+            queue_policy varchar(64) NOT NULL DEFAULT '',
+            trigger_type varchar(32) NOT NULL DEFAULT 'manual',
+            run_param text NOT NULL,
+            region varchar(255) NOT NULL DEFAULT '',
+            requested_slave_count int NOT NULL DEFAULT 0,
+            available_slave_count int NOT NULL DEFAULT 0,
+            allocated_slave_count int NOT NULL DEFAULT 0,
+            slave_hosts text NOT NULL,
+            message text NOT NULL,
+            enqueue_time datetime NULL,
+            start_time datetime NULL,
+            finish_time datetime NULL,
+            creator_id varchar(32) NOT NULL DEFAULT '',
+            creator varchar(32) NOT NULL DEFAULT '',
+            modifier_id varchar(32) NOT NULL DEFAULT '',
+            modifier varchar(32) NOT NULL DEFAULT '',
+            create_time {dt_default},
+            modify_time {dt_default},
+            PRIMARY KEY (id)
+        )
+        """
+        await conn.execute(text(ddl))
+        if dialect == "mysql":
+            await conn.execute(text("CREATE INDEX idx_execution_queue_status ON mysterious_execution_queue (status)"))
+            await conn.execute(text("CREATE INDEX idx_execution_queue_test_case_id ON mysterious_execution_queue (test_case_id)"))
+            await conn.execute(text("CREATE INDEX idx_execution_queue_report_id ON mysterious_execution_queue (report_id)"))
+        log.info("已创建 mysterious_execution_queue 表")
+
+
+async def ensure_execution_run_table() -> None:
+    """Create persistent execution run table for upgraded deployments."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+        if "mysterious_execution_run" not in tables:
+            ddl = f"""
+            CREATE TABLE mysterious_execution_run (
+                id {id_type},
+                report_id bigint NOT NULL DEFAULT 0,
+                test_case_id bigint NOT NULL DEFAULT 0,
+                region varchar(255) NOT NULL DEFAULT '',
+                status varchar(32) NOT NULL DEFAULT 'preparing',
+                worker_id varchar(128) NOT NULL DEFAULT '',
+                pid int NOT NULL DEFAULT 0,
+                pgid int NOT NULL DEFAULT 0,
+                cmd text NOT NULL,
+                jtl_path varchar(512) NOT NULL DEFAULT '',
+                log_path varchar(512) NOT NULL DEFAULT '',
+                heartbeat_at datetime NULL,
+                started_at datetime NULL,
+                finished_at datetime NULL,
+                stop_requested_at datetime NULL,
+                exit_code int NOT NULL DEFAULT 0,
+                message text NOT NULL,
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """
+            await conn.execute(text(ddl))
+            log.info("已创建 mysterious_execution_run 表")
+
+        indexes = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_indexes("mysterious_execution_run"))
+        index_names = {idx.get("name") for idx in indexes}
+        if "uk_execution_run_report_id" not in index_names:
+            await conn.execute(text("""
+                DELETE FROM mysterious_execution_run
+                WHERE id NOT IN (
+                    SELECT keep_id FROM (
+                        SELECT MIN(id) AS keep_id
+                        FROM mysterious_execution_run
+                        GROUP BY report_id
+                    ) AS keep_rows
+                )
+            """))
+            await conn.execute(text("CREATE UNIQUE INDEX uk_execution_run_report_id ON mysterious_execution_run (report_id)"))
+        if "idx_execution_run_status" not in index_names:
+            await conn.execute(text("CREATE INDEX idx_execution_run_status ON mysterious_execution_run (status)"))
+
+
+async def ensure_execution_node_table() -> None:
+    """Create execution node lease table for upgraded deployments."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+        if "mysterious_execution_node" not in tables:
+            ddl = f"""
+            CREATE TABLE mysterious_execution_node (
+                id {id_type},
+                report_id bigint NOT NULL DEFAULT 0,
+                test_case_id bigint NOT NULL DEFAULT 0,
+                execution_run_id bigint NOT NULL DEFAULT 0,
+                node_id bigint NOT NULL DEFAULT 0,
+                node_host varchar(128) NOT NULL DEFAULT '',
+                region varchar(255) NOT NULL DEFAULT '',
+                status varchar(32) NOT NULL DEFAULT 'leased',
+                leased_at datetime NULL,
+                released_at datetime NULL,
+                release_message text NOT NULL,
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """
+            await conn.execute(text(ddl))
+            log.info("已创建 mysterious_execution_node 表")
+
+        indexes = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_indexes("mysterious_execution_node"))
+        index_names = {idx.get("name") for idx in indexes}
+        if "idx_execution_node_report_id" not in index_names:
+            await conn.execute(text("CREATE INDEX idx_execution_node_report_id ON mysterious_execution_node (report_id)"))
+        if "idx_execution_node_node_id_status" not in index_names:
+            await conn.execute(text("CREATE INDEX idx_execution_node_node_id_status ON mysterious_execution_node (node_id, status)"))
+        if "idx_execution_node_status" not in index_names:
+            await conn.execute(text("CREATE INDEX idx_execution_node_status ON mysterious_execution_node (status)"))
+
+
+async def ensure_report_metric_snapshot_table() -> None:
+    """Create report metric snapshot table for upgraded deployments."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+        if "mysterious_report_metric_snapshot" not in tables:
+            ddl = f"""
+            CREATE TABLE mysterious_report_metric_snapshot (
+                id {id_type},
+                report_id bigint NOT NULL DEFAULT 0,
+                window_sec int NOT NULL DEFAULT 5,
+                bucket_start_ms bigint NOT NULL DEFAULT 0,
+                timestamp varchar(32) NOT NULL DEFAULT '',
+                qps double NOT NULL DEFAULT 0,
+                avg_rt double NOT NULL DEFAULT 0,
+                p95_rt double NOT NULL DEFAULT 0,
+                p99_rt double NOT NULL DEFAULT 0,
+                error_rate double NOT NULL DEFAULT 0,
+                threads int NOT NULL DEFAULT 0,
+                sample_count int NOT NULL DEFAULT 0,
+                fail_count int NOT NULL DEFAULT 0,
+                tps_peak double NOT NULL DEFAULT 0,
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """
+            await conn.execute(text(ddl))
+            log.info("已创建 mysterious_report_metric_snapshot 表")
+
+        indexes = await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).get_indexes("mysterious_report_metric_snapshot")
+        )
+        if any(idx.get("name") == "uk_report_metric_report_window_bucket" for idx in indexes):
+            return
+
+        await conn.execute(text("""
+            DELETE FROM mysterious_report_metric_snapshot
+            WHERE id NOT IN (
+                SELECT keep_id FROM (
+                    SELECT MIN(id) AS keep_id
+                    FROM mysterious_report_metric_snapshot
+                    GROUP BY report_id, window_sec, bucket_start_ms
+                ) AS keep_rows
+            )
+        """))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX uk_report_metric_report_window_bucket "
+            "ON mysterious_report_metric_snapshot (report_id, window_sec, bucket_start_ms)"
+        ))
+        log.info("已创建 mysterious_report_metric_snapshot 唯一索引")

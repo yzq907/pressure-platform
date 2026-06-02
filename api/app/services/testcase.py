@@ -55,6 +55,7 @@ from app.schemas.testcase import (
 )
 from app.services import config as config_service
 from app.services import csv as csv_service
+from app.services import execution_node as execution_node_service
 from app.services import jmeter_runner
 from app.services import report as report_service
 from app.core.jmeter_xml import csv_ignore_first_line, list_thread_groups, update_csv_filenames, update_run_thread
@@ -196,7 +197,12 @@ async def get_testcase_list(
 ) -> PageVO[TestCaseVO]:
     page_vo: PageVO[TestCaseVO] = PageVO(page=query.page, size=query.size, total=0, list=[])
     total = await crud.count(
-        db, id=query.id, name=query.name, biz=query.biz, service=query.service
+        db,
+        id=query.id,
+        name=query.name,
+        description=query.description,
+        biz=query.biz,
+        service=query.service,
     )
     if total <= 0:
         return page_vo
@@ -206,6 +212,7 @@ async def get_testcase_list(
         db,
         id=query.id,
         name=query.name,
+        description=query.description,
         biz=query.biz,
         service=query.service,
         offset=offset,
@@ -217,7 +224,12 @@ async def get_testcase_list(
 
 async def get_testcase_stats(db: AsyncSession, query: TestCaseQuery) -> TestCaseStatsVO:
     counts = await crud.count_by_status(
-        db, id=query.id, name=query.name, biz=query.biz, service=query.service
+        db,
+        id=query.id,
+        name=query.name,
+        description=query.description,
+        biz=query.biz,
+        service=query.service,
     )
     return TestCaseStatsVO(
         total=sum(counts.values()),
@@ -590,6 +602,82 @@ async def debug_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:
 
 
 async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserContext) -> bool:
+    if param.queue_policy == "queue_when_no_slave":
+        from app.services import execution_queue
+
+        should_queue, message, available_count = await _should_queue_run(db, id, param)
+        if should_queue:
+            await execution_queue.enqueue_manual_execution(
+                db,
+                testcase_id=id,
+                param=param,
+                user=user,
+                message=message,
+                available_slave_count=available_count,
+            )
+            return True
+
+    await _run_testcase_now(db, id, param, user)
+    return True
+
+
+async def run_testcase_legacy(db: AsyncSession, id: int, user: UserContext) -> bool:
+    running_cases = await crud.list_by_status(db, TestCaseStatus.RUN_ING.value)
+    if any(tc.id != id for tc in running_cases):
+        raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
+    await _run_testcase_now(
+        db,
+        id,
+        RunParam(slave_count=0),
+        user,
+        legacy_ignore_health=True,
+    )
+    return True
+
+
+async def _should_queue_run(
+    db: AsyncSession,
+    id: int,
+    param: RunParam,
+    *,
+    allow_waiting_queue_id: int | None = None,
+) -> tuple[bool, str, int]:
+    testcase = await crud.get_by_id(db, id)
+    if testcase is None:
+        raise MysteriousException(Codes.TESTCASE_NOT_EXIST)
+    jmx = await jmx_crud.get_by_test_case_id(db, id)
+    if jmx is None:
+        raise MysteriousException(Codes.JMX_NOT_EXIST)
+    if testcase.status == TestCaseStatus.RUN_ING.value:
+        raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
+    if await _is_init_artifact_testcase(db, id):
+        return False, "", 0
+
+    from app.crud import execution_queue as queue_crud
+
+    region = param.region.strip() if param.region else ""
+    active_queue = await queue_crud.get_active_by_testcase_region(db, id, region)
+    if active_queue is not None and active_queue.id != allow_waiting_queue_id:
+        raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
+
+    healthy_slaves = await execution_node_service.list_available_slaves(db, region=region or None)
+    total_available = len(healthy_slaves)
+    if region and total_available < 1:
+        return True, f"区域「{region}」暂无可用压力机（未占用），已进入执行队列", total_available
+    if param.slave_count > total_available:
+        return True, f"压测机数量不足: 需要{param.slave_count}台, 可用压力机（未占用）{total_available}台，已进入执行队列", total_available
+    return False, "", total_available
+
+
+async def _run_testcase_now(
+    db: AsyncSession,
+    id: int,
+    param: RunParam,
+    user: UserContext,
+    *,
+    queue_id: int | None = None,
+    legacy_ignore_health: bool = False,
+) -> int:
     bin_home = await _ensure_master_bin(db, "run")
     testcase = await crud.get_by_id(db, id)
     if testcase is None:
@@ -599,6 +687,18 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
         raise MysteriousException(Codes.JMX_NOT_EXIST)
 
     if testcase.status == TestCaseStatus.RUN_ING.value:
+        raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
+    if testcase.status == TestCaseStatus.RUN_WAITING.value and queue_id is None:
+        from app.crud import execution_queue as queue_crud
+
+        region = param.region.strip() if param.region else ""
+        if await queue_crud.get_active_by_testcase_region(db, id, region):
+            raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
+
+    if queue_id is not None:
+        await _claim_execution_queue_for_start(db, queue_id)
+
+    if testcase.status == TestCaseStatus.WAIT_CANCEL.value and queue_id is not None:
         raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
 
     is_init_artifact = await _is_init_artifact_testcase(db, id)
@@ -618,22 +718,23 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
         healthy_slaves = []
         log.info("初始化产物用例 %s 使用 master 本机执行，不分配压力机", id)
     else:
-        enable_slaves = await node_crud.list_enable_slaves(db, region=region or None)
+        healthy_slaves = await execution_node_service.list_available_slaves(
+            db,
+            region=region or None,
+            ignore_health=legacy_ignore_health,
+        )
 
-        # 过滤掉离线的 slave
-        healthy_slaves = [s for s in enable_slaves if s.health_status == 1]
-
-        # 用户可选择使用多少台 slave
+        # 用户可选择使用多少台未占用 slave
         total_available = len(healthy_slaves)
         if region and total_available < 1:
             raise MysteriousException(
                 Codes.FAIL,
-                message=f"区域「{region}」暂无可用压力机，无法执行",
+                message=f"区域「{region}」暂无可用压力机（未占用），无法执行",
             )
         if param.slave_count > total_available:
             raise MysteriousException(
                 Codes.FAIL,
-                message=f"压测机数量不足: 需要{param.slave_count}台, 可用{total_available}台",
+                message=f"压测机数量不足: 需要{param.slave_count}台, 可用压力机（未占用）{total_available}台",
             )
         if param.slave_count > 0 and param.slave_count <= total_available:
             healthy_slaves = healthy_slaves[:param.slave_count]
@@ -696,12 +797,16 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
         csvs = await csv_crud.get_by_test_case_id(db, id)
         await _prepare_split_csv_files(csvs, healthy_slaves, str(Path(data_dir).resolve().parent), run_jmx_path)
     actual_slave_count = max(1, slave_count)
+    remote_hosts = [
+        s.host if legacy_ignore_health else f"{s.host}:1099"
+        for s in healthy_slaves
+    ]
     _write_run_meta(
         data_dir,
         total_threads=total_threads,
         slave_count=actual_slave_count,
         per_slave_threads=per_slave_threads,
-        slave_hosts=[f"{s.host}:1099" for s in healthy_slaves],
+        slave_hosts=remote_hosts,
     )
 
     cmd = [
@@ -711,7 +816,7 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
         run_jmx_path,
     ]
     if healthy_slaves:
-        cmd += ["-R", ",".join(f"{s.host}:1099" for s in healthy_slaves)]
+        cmd += ["-R", ",".join(remote_hosts)]
     if is_init_artifact:
         cmd.append(f"-JartifactDir={artifact_dir}")
     cmd += [
@@ -754,16 +859,111 @@ async def run_testcase(db: AsyncSession, id: int, param: RunParam, user: UserCon
         user,
     )
 
+    if queue_id is not None:
+        await _bind_execution_queue_report(
+            db,
+            queue_id=queue_id,
+            report_id=report_id,
+            slave_count=actual_slave_count,
+            slave_hosts=remote_hosts,
+        )
+
+    if healthy_slaves:
+        try:
+            await execution_node_service.lease_nodes(
+                db,
+                report_id=report_id,
+                test_case_id=id,
+                nodes=healthy_slaves,
+                region=region,
+            )
+        except RuntimeError as e:
+            await _mark_run_start_failed(
+                db,
+                testcase=testcase,
+                report_id=report_id,
+                queue_id=queue_id,
+                message=str(e),
+                user=user,
+            )
+            raise MysteriousException(Codes.FAIL, message=str(e)) from e
+
     log.info("[run] cmd=%s region=%s", " ".join(cmd), region or "全部")
-    await jmeter_runner.launch_jmeter(
-        cmd,
-        testcase_id=id,
-        report_id=report_id,
-        exec_type=ExecType.EXEC.value,
-        jtl_path=jtl_path,
-        log_file_path=log_path,
-    )
-    return True
+    try:
+        await jmeter_runner.launch_jmeter(
+            cmd,
+            testcase_id=id,
+            report_id=report_id,
+            exec_type=ExecType.EXEC.value,
+            jtl_path=jtl_path,
+            log_file_path=log_path,
+        )
+    except Exception:
+        await _mark_run_start_failed(
+            db,
+            testcase=testcase,
+            report_id=report_id,
+            queue_id=queue_id,
+            message="JMeter 启动失败",
+            user=user,
+        )
+        await execution_node_service.release_by_report(db, report_id, message="JMeter 启动失败，释放压力机租约")
+        raise
+    return report_id
+
+
+async def _mark_run_start_failed(
+    db: AsyncSession,
+    *,
+    testcase: TestCase,
+    report_id: int,
+    queue_id: int | None,
+    message: str,
+    user: UserContext,
+) -> None:
+    testcase.status = TestCaseStatus.RUN_FAILED.value
+    stamp_modify(testcase, user)
+    rpt = await report_crud.get_by_id(db, report_id)
+    if rpt is not None:
+        rpt.status = TestCaseStatus.RUN_FAILED.value
+        rpt.response_data = message
+    if queue_id is not None:
+        await _mark_execution_queue_stopped(db, report_id, message)
+    await db.commit()
+
+
+async def _claim_execution_queue_for_start(db: AsyncSession, queue_id: int) -> None:
+    from app.crud import execution_queue as queue_crud
+    from app.services import execution_queue as queue_service
+
+    queue = await queue_crud.get_by_id(db, queue_id)
+    if queue is None or queue.status != queue_service.STATUS_PENDING:
+        raise MysteriousException(Codes.FAIL, message="执行队列任务已取消或状态已变更")
+    queue.status = queue_service.STATUS_RUNNING
+    queue.start_time = datetime.now(SHANGHAI).replace(tzinfo=None)
+    queue.message = "正在准备执行"
+    await db.commit()
+
+
+async def _bind_execution_queue_report(
+    db: AsyncSession,
+    *,
+    queue_id: int,
+    report_id: int,
+    slave_count: int,
+    slave_hosts: list[str],
+) -> None:
+    from app.crud import execution_queue as queue_crud
+    from app.services import execution_queue as queue_service
+
+    queue = await queue_crud.get_by_id(db, queue_id)
+    if queue is None or queue.status != queue_service.STATUS_RUNNING:
+        raise MysteriousException(Codes.FAIL, message="执行队列任务已取消或状态已变更")
+    queue.report_id = report_id
+    queue.allocated_slave_count = slave_count
+    queue.slave_hosts = json.dumps(slave_hosts, ensure_ascii=False)
+    queue.message = "已开始执行"
+    await db.commit()
 
 
 async def list_run_thread_groups(db: AsyncSession, id: int) -> list[dict[str, str]]:
@@ -796,6 +996,8 @@ async def stop_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:
         log.info("[stop] report_id=%s region=%s ok=%s", rpt.id, rpt.region, ok)
         remote_message = await _stop_remote_engines(db, rpt)
         _mark_report_stopped(testcase, rpt, ok, remote_message)
+        await _mark_execution_queue_stopped(db, rpt.id, f"用户手动停止{remote_message}")
+        await execution_node_service.release_by_report(db, rpt.id, message=f"用户手动停止{remote_message}")
     await db.commit()
     return True
 
@@ -813,6 +1015,8 @@ async def stop_execution(db: AsyncSession, report_id: int, user: UserContext) ->
     remote_message = await _stop_remote_engines(db, rpt)
     testcase = await crud.get_by_id(db, rpt.test_case_id)
     _mark_report_stopped(testcase, rpt, stopped, remote_message)
+    await _mark_execution_queue_stopped(db, rpt.id, f"用户手动停止{remote_message}")
+    await execution_node_service.release_by_report(db, rpt.id, message=f"用户手动停止{remote_message}")
     await db.commit()
     return True
 
@@ -829,6 +1033,18 @@ def _mark_report_stopped(
     report.status = TestCaseStatus.RUN_FAILED.value
     suffix = "" if stopped else "（未找到本地 JMeter 进程，已清理平台状态）"
     report.response_data = f"用户手动停止{suffix}{remote_message}"
+
+
+async def _mark_execution_queue_stopped(db: AsyncSession, report_id: int, message: str) -> None:
+    from app.crud import execution_queue as queue_crud
+    from app.services import execution_queue as queue_service
+
+    queue = await queue_crud.get_by_report_id(db, report_id)
+    if queue is None:
+        return
+    queue.status = queue_service.STATUS_FAILED
+    queue.finish_time = datetime.now(SHANGHAI).replace(tzinfo=None)
+    queue.message = message
 
 
 async def _stop_remote_engines(db: AsyncSession, report: ReportModel) -> str:

@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import NodeStatus, NodeType
+from app.models.execution_node import ExecutionNode
 from app.models.node import Node
 from app.models.scheduled_task import ScheduledTask
 from app.models.scheduled_task_log import ScheduledTaskLog
@@ -128,6 +129,72 @@ async def test_scheduled_task_triggered_records_slave_allocation(
     assert log.allocated_slave_count == 1
     assert json.loads(log.slave_hosts) == ["10.0.0.1"]
     assert log.next_run_at is not None
+
+
+@pytest.mark.asyncio
+async def test_scheduled_task_slave_allocation_excludes_leased_nodes(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    testcase = TestCase(name="scheduled_excludes_leased", status=0, test_case_dir="/tmp")
+    db.add(testcase)
+    busy = Node(
+        name="busy",
+        type=NodeType.SLAVE.value,
+        host="10.0.1.1",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+        region="华北",
+    )
+    idle = Node(
+        name="idle",
+        type=NodeType.SLAVE.value,
+        host="10.0.1.2",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+        region="华北",
+    )
+    db.add_all([busy, idle])
+    await db.commit()
+    await db.refresh(testcase)
+    await db.refresh(busy)
+    db.add(
+        ExecutionNode(
+            report_id=1101,
+            test_case_id=2201,
+            node_id=busy.id,
+            node_host=busy.host,
+            region="华北",
+            status="leased",
+        )
+    )
+    await db.commit()
+    task = await _create_task(db, test_case_id=testcase.id, region="华北", slave_count=1)
+
+    from app.services import testcase as testcase_service
+
+    async def fake_run_testcase(*args, **kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(testcase_service, "run_testcase", fake_run_testcase)
+
+    await _execute_scheduled(db, task)
+
+    log = (
+        await db.execute(
+            select(ScheduledTaskLog).where(ScheduledTaskLog.scheduled_task_id == task.id)
+        )
+    ).scalar_one()
+    assert log.status == "triggered"
+    assert log.available_slave_count == 1
+    assert log.allocated_slave_count == 1
+    assert json.loads(log.slave_hosts) == ["10.0.1.2"]
 
 
 @pytest.mark.asyncio

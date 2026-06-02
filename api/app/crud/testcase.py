@@ -40,15 +40,18 @@ async def count(
     db: AsyncSession,
     id: int | None = None,
     name: str | None = None,
+    description: str | None = None,
     biz: str | None = None,
     service: str | None = None,
 ) -> int:
-    """对齐 Java：id 精确匹配；name/biz/service LIKE %?%"""
+    """对齐 Java：id 精确匹配；name/description/biz/service LIKE %?%"""
     stmt = select(func.count()).select_from(TestCase)
     if id is not None:
         stmt = stmt.where(TestCase.id == id)
     if name is not None:
         stmt = stmt.where(TestCase.name.like(f"%{name}%"))
+    if description is not None:
+        stmt = stmt.where(TestCase.description.like(f"%{description}%"))
     if biz is not None:
         stmt = stmt.where(TestCase.biz.like(f"%{biz}%"))
     if service is not None:
@@ -60,6 +63,7 @@ def _apply_filters(
     stmt,
     id: int | None = None,
     name: str | None = None,
+    description: str | None = None,
     biz: str | None = None,
     service: str | None = None,
 ):
@@ -67,6 +71,8 @@ def _apply_filters(
         stmt = stmt.where(TestCase.id == id)
     if name is not None:
         stmt = stmt.where(TestCase.name.like(f"%{name}%"))
+    if description is not None:
+        stmt = stmt.where(TestCase.description.like(f"%{description}%"))
     if biz is not None:
         stmt = stmt.where(TestCase.biz.like(f"%{biz}%"))
     if service is not None:
@@ -78,12 +84,13 @@ async def count_by_status(
     db: AsyncSession,
     id: int | None = None,
     name: str | None = None,
+    description: str | None = None,
     biz: str | None = None,
     service: str | None = None,
 ) -> dict[int, int]:
     """按状态聚合统计，过滤条件与 list/count 保持一致。"""
     stmt = select(TestCase.status, func.count()).select_from(TestCase)
-    stmt = _apply_filters(stmt, id=id, name=name, biz=biz, service=service)
+    stmt = _apply_filters(stmt, id=id, name=name, description=description, biz=biz, service=service)
     stmt = stmt.group_by(TestCase.status)
     rows = (await db.execute(stmt)).all()
     return {int(status): int(total) for status, total in rows}
@@ -93,20 +100,20 @@ async def list_testcases(
     db: AsyncSession,
     id: int | None,
     name: str | None,
+    description: str | None,
     biz: str | None,
     service: str | None,
     offset: int,
     limit: int,
 ) -> list[TestCase]:
-    stmt = select(TestCase)
-    if id is not None:
-        stmt = stmt.where(TestCase.id == id)
-    if name is not None:
-        stmt = stmt.where(TestCase.name.like(f"%{name}%"))
-    if biz is not None:
-        stmt = stmt.where(TestCase.biz.like(f"%{biz}%"))
-    if service is not None:
-        stmt = stmt.where(TestCase.service.like(f"%{service}%"))
+    stmt = _apply_filters(
+        select(TestCase),
+        id=id,
+        name=name,
+        description=description,
+        biz=biz,
+        service=service,
+    )
     stmt = stmt.order_by(TestCase.modify_time.desc()).offset(offset).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
 

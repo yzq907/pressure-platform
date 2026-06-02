@@ -44,6 +44,7 @@ class ReportVO(BaseVO):
     slave_count: int = 0
     grafana_instance: str = ""
     artifact_dir: str = ""
+    occupied_node_hosts: list[str] = []
 
 
 class ReportStatsVO(CamelModel):
@@ -78,9 +79,11 @@ class MetricsVO(CamelModel):
     timestamp: str = ""
     qps: float = 0.0
     avg_rt: float = 0.0
+    p95_rt: float = 0.0
     p99_rt: float = 0.0
     error_rate: float = 0.0
     threads: int = 0
+    tps_peak: float = 0.0
 
 
 class ArtifactVO(CamelModel):

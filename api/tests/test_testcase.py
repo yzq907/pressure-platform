@@ -119,6 +119,42 @@ async def test_list_testcases_search_by_id_exact(
 
 
 @pytest.mark.asyncio
+async def test_list_testcases_search_by_description_fuzzy(
+    auth_client: AsyncClient, data_home: Path
+) -> None:
+    await auth_client.post("/testcase/add", json={"name": "desc_alpha", "description": "登录接口压测"})
+    await auth_client.post("/testcase/add", json={"name": "desc_beta", "description": "登录二维码压测"})
+    await auth_client.post("/testcase/add", json={"name": "desc_other", "description": "订单查询"})
+
+    resp = await auth_client.get("/testcase/list?page=1&size=10&description=登录")
+
+    page = resp.json()["data"]
+    assert page["total"] == 2
+    assert {item["name"] for item in page["list"]} == {"desc_alpha", "desc_beta"}
+
+
+@pytest.mark.asyncio
+async def test_testcase_stats_filters_by_description(
+    auth_client: AsyncClient, db: AsyncSession, data_home: Path
+) -> None:
+    rows = [
+        TestCase(name="desc_stat_idle", description="登录流程", status=TestCaseStatus.NOT_RUN.value, test_case_dir=str(data_home / "a")),
+        TestCase(name="desc_stat_success", description="登录流程", status=TestCaseStatus.RUN_SUCCESS.value, test_case_dir=str(data_home / "b")),
+        TestCase(name="desc_stat_other", description="订单流程", status=TestCaseStatus.RUN_FAILED.value, test_case_dir=str(data_home / "c")),
+    ]
+    db.add_all(rows)
+    await db.commit()
+
+    resp = await auth_client.get("/testcase/stats?page=1&size=10&description=登录")
+
+    data = resp.json()["data"]
+    assert data["total"] == 2
+    assert data["idle"] == 1
+    assert data["success"] == 1
+    assert data["failed"] == 0
+
+
+@pytest.mark.asyncio
 async def test_testcase_stats_counts_all_matching_rows(
     auth_client: AsyncClient, db: AsyncSession, data_home: Path
 ) -> None:

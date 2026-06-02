@@ -137,15 +137,14 @@ async def _build_slave_context(
             "is_init_artifact": True,
         }
 
-    from app.crud import node as node_crud
+    from app.services import execution_node
 
-    slaves = await node_crud.list_enable_slaves(db, region=region or None)
-    healthy = [s for s in slaves if s.health_status == 1]
-    allocated = healthy[:requested] if requested > 0 else healthy
+    available_slaves = await execution_node.list_available_slaves(db, region=region or None)
+    allocated = available_slaves[:requested] if requested > 0 else available_slaves
     return {
         "region": region,
         "requested_slave_count": requested,
-        "available_slave_count": len(healthy),
+        "available_slave_count": len(available_slaves),
         "allocated_slave_count": len(allocated),
         "slave_hosts": [s.host for s in allocated],
         "is_init_artifact": False,
@@ -455,7 +454,7 @@ async def _execute_scheduled(db: AsyncSession, task: ScheduledTask) -> None:
         available = int(slave_context["available_slave_count"])
         requested = int(slave_context["requested_slave_count"])
         if region and available < 1:
-            reason = f"区域「{region}」暂无可用压力机，跳过执行"
+            reason = f"区域「{region}」暂无可用压力机（未占用），跳过执行"
             execution_log = await _add_execution_log(
                 db,
                 task,
@@ -472,7 +471,7 @@ async def _execute_scheduled(db: AsyncSession, task: ScheduledTask) -> None:
             )
             return
         if not bool(slave_context.get("is_init_artifact")) and requested > available:
-            reason = f"可用压力机不足，跳过执行：需要{requested}台，可用{available}台"
+            reason = f"可用压力机不足（未占用），跳过执行：需要{requested}台，可用{available}台"
             execution_log = await _add_execution_log(
                 db,
                 task,

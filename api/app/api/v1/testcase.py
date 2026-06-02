@@ -13,6 +13,7 @@ from app.core.response import PageVO, Response, success
 from app.db.session import get_db
 from app.deps.auth import get_current_user_dep
 from app.deps.permission import require_any_permission, require_permission
+from app.schemas.execution_queue import ExecutionQueueQuery, ExecutionQueueVO
 from app.schemas.testcase import (
     BatchDeleteParam,
     JMeterResultVO,
@@ -25,6 +26,7 @@ from app.schemas.testcase import (
     ThreadGroupRunVO,
 )
 from app.services import testcase as service
+from app.services import execution_queue as execution_queue_service
 
 router = APIRouter(
     prefix="/testcase",
@@ -158,6 +160,21 @@ async def run_testcase(
 
 
 @router.get(
+    "/run/{id}",
+    summary="执行用例（兼容旧GET调用）",
+    response_model=Response[bool],
+    response_model_by_alias=True,
+)
+async def run_testcase_legacy(
+    id: int,
+    current: UserContext = Depends(require_permission(PERMISSION_TESTCASE)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[bool]:
+    ok = await service.run_testcase_legacy(db, id, current)
+    return success(ok)
+
+
+@router.get(
     "/runThreadGroups/{id}",
     summary="查询用例 JMX 中可配置的线程组",
     response_model=Response[list[ThreadGroupRunVO]],
@@ -199,6 +216,36 @@ async def stop_execution(
     db: AsyncSession = Depends(get_db),
 ) -> Response[bool]:
     ok = await service.stop_execution(db, report_id, current)
+    return success(ok)
+
+
+@router.get(
+    "/executionQueue",
+    summary="查询执行队列",
+    response_model=Response[PageVO[ExecutionQueueVO]],
+    response_model_by_alias=True,
+)
+async def execution_queue(
+    query: ExecutionQueueQuery = Depends(),
+    current: UserContext = Depends(require_any_permission(PERMISSION_TESTCASE, PERMISSION_EXECUTION)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[PageVO[ExecutionQueueVO]]:
+    page = await execution_queue_service.get_execution_queue_list(db, query)
+    return success(page)
+
+
+@router.get(
+    "/cancelQueuedExecution/{queue_id}",
+    summary="取消待执行队列任务",
+    response_model=Response[bool],
+    response_model_by_alias=True,
+)
+async def cancel_queued_execution(
+    queue_id: int,
+    current: UserContext = Depends(require_any_permission(PERMISSION_TESTCASE, PERMISSION_EXECUTION)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[bool]:
+    ok = await execution_queue_service.cancel_pending_execution(db, queue_id, current)
     return success(ok)
 
 

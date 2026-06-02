@@ -4,6 +4,9 @@ from app.models.audit_log import AuditLog
 from app.models.ai_generation import AiGenerationArtifact, AiGenerationTask
 from app.models.config import Config
 from app.models.csv import Csv
+from app.models.execution_node import ExecutionNode
+from app.models.execution_queue import ExecutionQueue
+from app.models.execution_run import ExecutionRun
 from app.models.jar import Jar
 from app.models.jmx import Jmx
 from app.models.jmx_assertion import JmxAssertion
@@ -17,6 +20,7 @@ from app.models.jmx_stepping_thread_group import JmxSteppingThreadGroup
 from app.models.jmx_thread_group import JmxThreadGroup
 from app.models.node import Node
 from app.models.report import Report
+from app.models.report_metric_snapshot import ReportMetricSnapshot
 from app.models.role import Role, RolePermission
 from app.models.scheduled_task import ScheduledTask
 from app.models.scheduled_task_log import ScheduledTaskLog
@@ -29,6 +33,9 @@ __all__ = [
     "AiGenerationTask",
     "Config",
     "Csv",
+    "ExecutionNode",
+    "ExecutionQueue",
+    "ExecutionRun",
     "Jar",
     "Jmx",
     "JmxAssertion",
@@ -42,6 +49,7 @@ __all__ = [
     "JmxThreadGroup",
     "Node",
     "Report",
+    "ReportMetricSnapshot",
     "Role",
     "RolePermission",
     "ScheduledTask",

@@ -112,9 +112,10 @@ async def get_enable_slave_list(db: AsyncSession) -> list[NodeVO]:
 
 
 async def get_enable_slave_count(db: AsyncSession, region: str | None = None) -> int:
-    """返回健康（已启用且在线）的 slave 节点数量，可选按区域过滤。"""
-    nodes = await crud.list_enable_slaves(db, region=region)
-    return len([n for n in nodes if n.health_status == 1])
+    """返回可用于新执行的 slave 数量：启用、在线且未被执行租约占用。"""
+    from app.services import execution_node
+
+    return await execution_node.count_available_slaves(db, region=region)
 
 
 async def get_all_regions(db: AsyncSession) -> list[str]:

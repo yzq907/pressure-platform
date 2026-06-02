@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import ExecType, NodeStatus, NodeType, TestCaseStatus
 from app.models.config import Config
+from app.models.execution_node import ExecutionNode
 from app.models.node import Node
 from app.models.report import Report
 from app.models.testcase import TestCase
@@ -440,6 +441,162 @@ async def test_run_with_slaves_adds_R_flag(
     r_idx = captured["cmd"].index("-R")
     assert captured["cmd"][r_idx + 1] == "10.0.0.1,10.0.0.2"
     await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_run_skips_slave_with_active_node_lease(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+
+    busy = Node(
+        name="busy-slave",
+        type=NodeType.SLAVE.value,
+        host="10.0.11.1",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+        region="长沙",
+    )
+    free = Node(
+        name="free-slave",
+        type=NodeType.SLAVE.value,
+        host="10.0.11.2",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+        region="长沙",
+    )
+    db.add_all([busy, free])
+    await db.commit()
+    await db.refresh(busy)
+    db.add(
+        ExecutionNode(
+            report_id=999,
+            test_case_id=999,
+            node_id=busy.id,
+            node_host=busy.host,
+            region="长沙",
+            status="leased",
+        )
+    )
+    await db.commit()
+
+    case_id = await _create_case_with_jmx(auth_client, "r_lease_skip", sample_jmx_bytes)
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "10", "rampTime": "0", "duration": "60", "slaveCount": 1, "region": "长沙"},
+    )
+
+    assert resp.json()["code"] == 0
+    assert "-R" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("-R") + 1] == "10.0.11.2:1099"
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_run_releases_node_lease_when_jmeter_finishes(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+) -> None:
+    db.add(
+        Node(
+            name="lease-release-slave",
+            type=NodeType.SLAVE.value,
+            host="10.0.11.3",
+            username="root",
+            password="x",
+            port=22,
+            status=NodeStatus.ENABLE.value,
+            health_status=1,
+            region="长沙",
+        )
+    )
+    await db.commit()
+
+    case_id = await _create_case_with_jmx(auth_client, "r_lease_release", sample_jmx_bytes)
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "10", "rampTime": "0", "duration": "60", "slaveCount": 1, "region": "长沙"},
+    )
+
+    assert resp.json()["code"] == 0
+    report = (await db.execute(select(Report).where(Report.test_case_id == case_id))).scalar_one()
+    await jmeter_runner.wait_for_completion(report.id, timeout=10.0)
+    leases = (
+        await db.execute(select(ExecutionNode).where(ExecutionNode.report_id == report.id))
+    ).scalars().all()
+    assert len(leases) == 1
+    assert leases[0].status == "released"
+    assert leases[0].released_at is not None
+
+
+@pytest.mark.asyncio
+async def test_run_rolls_back_status_when_node_lease_conflicts(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.add(
+        Node(
+            name="lease-conflict-slave",
+            type=NodeType.SLAVE.value,
+            host="10.0.11.4",
+            username="root",
+            password="x",
+            port=22,
+            status=NodeStatus.ENABLE.value,
+            health_status=1,
+            region="长沙",
+        )
+    )
+    await db.commit()
+    case_id = await _create_case_with_jmx(auth_client, "r_lease_conflict", sample_jmx_bytes)
+
+    from app.services import execution_node as execution_node_service
+
+    async def conflict(*args, **kwargs):
+        raise RuntimeError("压力机已被占用: 10.0.11.4")
+
+    monkeypatch.setattr(execution_node_service, "lease_nodes", conflict)
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "10", "rampTime": "0", "duration": "60", "slaveCount": 1, "region": "长沙"},
+    )
+    body = resp.json()
+    assert body["success"] is False
+    assert "压力机已被占用" in body["message"]
+
+    tc = (await db.execute(select(TestCase).where(TestCase.id == case_id))).scalar_one()
+    report = (
+        await db.execute(select(Report).where(Report.test_case_id == case_id))
+    ).scalar_one()
+    assert tc.status == TestCaseStatus.RUN_FAILED.value
+    assert report.status == TestCaseStatus.RUN_FAILED.value
+    assert "压力机已被占用" in report.response_data
 
 
 @pytest.mark.asyncio
