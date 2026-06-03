@@ -89,6 +89,35 @@ async def test_report_list_by_test_case(auth_client: AsyncClient, db: AsyncSessi
 
 
 @pytest.mark.asyncio
+async def test_report_list_filters_by_exec_type(auth_client: AsyncClient, db: AsyncSession) -> None:
+    await _insert_report(db, name="type_debug", exec_type=ExecType.DEBUG.value)
+    await _insert_report(db, name="type_run", exec_type=ExecType.EXEC.value)
+
+    resp = await auth_client.get(f"/report/list?page=1&size=10&execType={ExecType.EXEC.value}")
+
+    page = resp.json()["data"]
+    assert page["total"] == 1
+    assert page["list"][0]["name"] == "type_run"
+
+
+@pytest.mark.asyncio
+async def test_report_list_by_test_case_filters_by_exec_type(
+    auth_client: AsyncClient, db: AsyncSession
+) -> None:
+    await _insert_report(db, name="case_debug", test_case_id=88, exec_type=ExecType.DEBUG.value)
+    await _insert_report(db, name="case_run", test_case_id=88, exec_type=ExecType.EXEC.value)
+    await _insert_report(db, name="case_other", test_case_id=99, exec_type=ExecType.EXEC.value)
+
+    resp = await auth_client.get(
+        f"/report/listByTestCase?page=1&size=10&testCaseId=88&execType={ExecType.DEBUG.value}"
+    )
+
+    page = resp.json()["data"]
+    assert page["total"] == 1
+    assert page["list"][0]["name"] == "case_debug"
+
+
+@pytest.mark.asyncio
 async def test_report_list_includes_active_occupied_node_hosts(
     auth_client: AsyncClient, db: AsyncSession
 ) -> None:

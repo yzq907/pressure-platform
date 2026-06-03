@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,97 @@ async def test_list_testcases_search_by_id_exact(
     page = resp.json()["data"]
     assert page["total"] == 1
     assert page["list"][0]["id"] == case_id
+
+
+@pytest.mark.asyncio
+async def test_list_testcases_defaults_to_id_desc(
+    auth_client: AsyncClient, db: AsyncSession, data_home: Path
+) -> None:
+    rows = [
+        TestCase(name="sort_default_a", test_case_dir=str(data_home / "sort_default_a")),
+        TestCase(name="sort_default_b", test_case_dir=str(data_home / "sort_default_b")),
+        TestCase(name="sort_default_c", test_case_dir=str(data_home / "sort_default_c")),
+    ]
+    db.add_all(rows)
+    await db.commit()
+
+    resp = await auth_client.get("/testcase/list?page=1&size=10&name=sort_default_")
+
+    items = resp.json()["data"]["list"]
+    assert [item["id"] for item in items] == sorted([row.id for row in rows], reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_list_testcases_sorts_by_create_time_asc(
+    auth_client: AsyncClient, db: AsyncSession, data_home: Path
+) -> None:
+    old = TestCase(
+        name="sort_create_old",
+        test_case_dir=str(data_home / "sort_create_old"),
+        create_time=datetime(2026, 1, 1, 10, 0, 0),
+        modify_time=datetime(2026, 1, 1, 10, 0, 0),
+    )
+    new = TestCase(
+        name="sort_create_new",
+        test_case_dir=str(data_home / "sort_create_new"),
+        create_time=datetime(2026, 1, 2, 10, 0, 0),
+        modify_time=datetime(2026, 1, 3, 10, 0, 0),
+    )
+    db.add_all([new, old])
+    await db.commit()
+
+    resp = await auth_client.get(
+        "/testcase/list?page=1&size=10&name=sort_create_&sortBy=createTime&sortOrder=asc"
+    )
+
+    items = resp.json()["data"]["list"]
+    assert [item["name"] for item in items] == ["sort_create_old", "sort_create_new"]
+
+
+@pytest.mark.asyncio
+async def test_list_testcases_sorts_by_modify_time_asc(
+    auth_client: AsyncClient, db: AsyncSession, data_home: Path
+) -> None:
+    old = TestCase(
+        name="sort_modify_old",
+        test_case_dir=str(data_home / "sort_modify_old"),
+        create_time=datetime(2026, 1, 2, 10, 0, 0),
+        modify_time=datetime(2026, 1, 1, 10, 0, 0),
+    )
+    new = TestCase(
+        name="sort_modify_new",
+        test_case_dir=str(data_home / "sort_modify_new"),
+        create_time=datetime(2026, 1, 1, 10, 0, 0),
+        modify_time=datetime(2026, 1, 2, 10, 0, 0),
+    )
+    db.add_all([old, new])
+    await db.commit()
+
+    resp = await auth_client.get(
+        "/testcase/list?page=1&size=10&name=sort_modify_&sortBy=modifyTime&sortOrder=asc"
+    )
+
+    items = resp.json()["data"]["list"]
+    assert [item["name"] for item in items] == ["sort_modify_old", "sort_modify_new"]
+
+
+@pytest.mark.asyncio
+async def test_list_testcases_invalid_sort_falls_back_to_id_desc(
+    auth_client: AsyncClient, db: AsyncSession, data_home: Path
+) -> None:
+    rows = [
+        TestCase(name="sort_invalid_a", test_case_dir=str(data_home / "sort_invalid_a")),
+        TestCase(name="sort_invalid_b", test_case_dir=str(data_home / "sort_invalid_b")),
+    ]
+    db.add_all(rows)
+    await db.commit()
+
+    resp = await auth_client.get(
+        "/testcase/list?page=1&size=10&name=sort_invalid_&sortBy=unknown&sortOrder=bad"
+    )
+
+    items = resp.json()["data"]["list"]
+    assert [item["id"] for item in items] == sorted([row.id for row in rows], reverse=True)
 
 
 @pytest.mark.asyncio

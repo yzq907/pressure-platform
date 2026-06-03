@@ -45,6 +45,7 @@ async def count(
     name: str | None = None,
     test_case_id: int | None = None,
     region: str | None = None,
+    exec_type: int | None = None,
 ) -> int:
     stmt = select(func.count()).select_from(Report)
     if name is not None:
@@ -53,6 +54,8 @@ async def count(
         stmt = stmt.where(Report.test_case_id == test_case_id)
     if region is not None:
         stmt = stmt.where(Report.region.like(f"%{region}%"))
+    if exec_type is not None:
+        stmt = stmt.where(Report.exec_type == exec_type)
     return (await db.execute(stmt)).scalar_one() or 0
 
 
@@ -61,6 +64,7 @@ async def count_by_status(
     name: str | None = None,
     test_case_id: int | None = None,
     region: str | None = None,
+    exec_type: int | None = None,
 ) -> dict[int, int]:
     """按报告状态聚合统计，过滤条件与报告列表保持一致。"""
     stmt = select(Report.status, func.count()).select_from(Report)
@@ -70,6 +74,8 @@ async def count_by_status(
         stmt = stmt.where(Report.test_case_id == test_case_id)
     if region is not None:
         stmt = stmt.where(Report.region.like(f"%{region}%"))
+    if exec_type is not None:
+        stmt = stmt.where(Report.exec_type == exec_type)
     stmt = stmt.group_by(Report.status)
     rows = (await db.execute(stmt)).all()
     return {int(status): int(cnt) for status, cnt in rows}
@@ -79,6 +85,7 @@ async def list_reports(
     db: AsyncSession,
     name: str | None,
     region: str | None,
+    exec_type: int | None,
     offset: int,
     limit: int,
 ) -> list[Report]:
@@ -87,6 +94,8 @@ async def list_reports(
         stmt = stmt.where(Report.name.like(f"%{name}%"))
     if region is not None:
         stmt = stmt.where(Report.region.like(f"%{region}%"))
+    if exec_type is not None:
+        stmt = stmt.where(Report.exec_type == exec_type)
     stmt = stmt.order_by(Report.modify_time.desc()).offset(offset).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
 
@@ -95,6 +104,7 @@ async def list_by_test_case(
     db: AsyncSession,
     name: str | None,
     test_case_id: int | None,
+    exec_type: int | None,
     offset: int,
     limit: int,
 ) -> list[Report]:
@@ -103,6 +113,8 @@ async def list_by_test_case(
         stmt = stmt.where(Report.name.like(f"%{name}%"))
     if test_case_id is not None:
         stmt = stmt.where(Report.test_case_id == test_case_id)
+    if exec_type is not None:
+        stmt = stmt.where(Report.exec_type == exec_type)
     stmt = stmt.order_by(Report.modify_time.desc()).offset(offset).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
 

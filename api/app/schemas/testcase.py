@@ -8,6 +8,7 @@ from app.schemas.base import BaseQuery, BaseVO, CamelModel
 from app.schemas.csv import CsvVO
 from app.schemas.jar import JarVO
 from app.schemas.jmx import JmxVO
+from app.schemas.upload_file import UploadFileVO
 
 
 class TestCaseParam(CamelModel):
@@ -42,6 +43,8 @@ class TestCaseQuery(BaseQuery):
     description: str | None = None
     biz: str | None = None
     service: str | None = None
+    sort_by: str = "id"
+    sort_order: str = "desc"
 
 
 class TestCaseStatsVO(CamelModel):
@@ -63,7 +66,7 @@ class BatchDeleteParam(CamelModel):
 
 
 class TestCaseFullVO(TestCaseVO):
-    """对齐 Java TestCaseFullVO：用例 + 关联的 JMX/CSV/JAR。
+    """对齐 Java TestCaseFullVO：用例 + 关联的 JMX/CSV/JAR/上传接口文件。
 
     显式指定 alias 让 JSON key 是 `jmxVO/csvVOList/jarVOList`，对齐 Java（默认 to_camel 会得到 jmxVo/csvVoList）。
     """
@@ -71,6 +74,7 @@ class TestCaseFullVO(TestCaseVO):
     jmx_vo: JmxVO | None = Field(default=None, alias="jmxVO")
     csv_vo_list: list[CsvVO] = Field(default_factory=list, alias="csvVOList")
     jar_vo_list: list[JarVO] = Field(default_factory=list, alias="jarVOList")
+    upload_file_vo_list: list[UploadFileVO] = Field(default_factory=list, alias="uploadFileVOList")
 
 
 class RunParam(CamelModel):

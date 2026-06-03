@@ -46,6 +46,38 @@ async def _create_case_with_jmx(
     return case_id
 
 
+UPLOAD_FILE_JMX = b"""<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan>
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Test Plan" enabled="true"/>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">1</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="upload" enabled="true">
+          <elementProp name="HTTPsampler.Files" elementType="HTTPFileArgs">
+            <collectionProp name="HTTPFileArgs.files">
+              <elementProp name="avatar.jpg" elementType="HTTPFileArg">
+                <stringProp name="File.path">avatar.jpg</stringProp>
+                <stringProp name="File.paramname">file</stringProp>
+                <stringProp name="File.mimetype">image/jpeg</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
+"""
+
+
 # ---------------------------------------------------------------------------
 # debug
 # ---------------------------------------------------------------------------
@@ -653,6 +685,58 @@ async def test_run_syncs_current_case_dependencies_to_selected_slaves(
     assert all(call[2] is True for call in scp_calls)
     assert any(local_path.endswith("/csv/data.csv") for local_path, _, _ in scp_calls)
     assert any(local_path.endswith("/jar/dep.jar") for local_path, _, _ in scp_calls)
+
+
+@pytest.mark.asyncio
+async def test_run_syncs_upload_file_and_rewrites_run_jmx(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    """执行前应同步上传接口文件，并把 run JMX 中 File.path 改为平台路径。"""
+    from app.core import ssh as ssh_mod
+
+    case_id = await _create_case_with_jmx(auth_client, "r_sync_upload", UPLOAD_FILE_JMX)
+    await auth_client.post(
+        f"/uploadFile/upload/{case_id}",
+        files={"uploadFile": ("avatar.jpg", b"img", "image/jpeg")},
+    )
+
+    scp_calls: list[tuple[str, str, bool]] = []
+
+    async def tracking_scp(self, local_path: str, remote_dir: str, *, raise_on_error: bool = False) -> None:
+        scp_calls.append((local_path, remote_dir, raise_on_error))
+
+    monkeypatch.setattr(ssh_mod.SSHClient, "scp_file", tracking_scp)
+
+    db.add(
+        Node(
+            name="upload-sync-slave",
+            type=NodeType.SLAVE.value,
+            host="10.0.9.2",
+            username="root",
+            password="x",
+            port=22,
+            status=NodeStatus.ENABLE.value,
+            health_status=1,
+        )
+    )
+    await db.commit()
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "10", "rampTime": "0", "duration": "60", "slaveCount": 1},
+    )
+    assert resp.json()["code"] == 0
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+    upload_path = str(next(data_home.glob("r_sync_upload_*/upload/avatar.jpg")))
+    assert any(local_path == upload_path and raise_on_error is True for local_path, _, raise_on_error in scp_calls)
+
+    run_jmx = next(data_home.glob("r_sync_upload_*/jmx/run_*.jmx"))
+    assert upload_path in run_jmx.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

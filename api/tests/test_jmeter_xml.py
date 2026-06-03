@@ -224,6 +224,40 @@ def test_update_csv_filename_changes_filepath(tmp_path: Path) -> None:
     assert filenames == [new_path]
 
 
+def test_update_upload_file_paths_changes_http_file_arg_only(tmp_path: Path) -> None:
+    jmx = tmp_path / "upload_file.jmx"
+    jmx.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan>
+  <hashTree>
+    <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="upload" enabled="true">
+      <elementProp name="HTTPsampler.Files" elementType="HTTPFileArgs">
+        <collectionProp name="HTTPFileArgs.files">
+          <elementProp name="avatar.jpg" elementType="HTTPFileArg">
+            <stringProp name="File.path">avatar.jpg</stringProp>
+            <stringProp name="File.paramname">file</stringProp>
+            <stringProp name="File.mimetype">image/jpeg</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+      <stringProp name="Argument.value">avatar.jpg</stringProp>
+    </HTTPSamplerProxy>
+  </hashTree>
+</jmeterTestPlan>
+""",
+        encoding="utf-8",
+    )
+
+    new_path = "/data/case/upload/avatar.jpg"
+    assert jmeter_xml.exist_upload_file_path(str(jmx), "avatar.jpg") is True
+
+    jmeter_xml.update_upload_file_paths(str(jmx), {"avatar.jpg": new_path})
+
+    tree = etree.parse(str(jmx))
+    assert _find_named_text(tree, "HTTPSamplerProxy", "File.path") == [new_path]
+    assert _find_named_text(tree, "HTTPSamplerProxy", "Argument.value") == ["avatar.jpg"]
+
+
 def test_csv_filename_matches_windows_path_basename(tmp_path: Path) -> None:
     jmx = tmp_path / "windows_csv_path.jmx"
     jmx.write_text(

@@ -35,6 +35,7 @@ from app.crud import jmx as jmx_crud
 from app.crud import node as node_crud
 from app.crud import report as report_crud
 from app.crud import testcase as crud
+from app.crud import upload_file as upload_file_crud
 from app.models.csv import Csv
 from app.models.jar import Jar
 from app.models.jmx import Jmx
@@ -43,6 +44,7 @@ from app.models.testcase import TestCase
 from app.schemas.csv import CsvVO
 from app.schemas.jar import JarVO
 from app.schemas.jmx import JmxVO
+from app.schemas.upload_file import UploadFileVO
 from app.schemas.report import ReportParam
 from app.schemas.testcase import (
     JMeterResultVO,
@@ -58,7 +60,13 @@ from app.services import csv as csv_service
 from app.services import execution_node as execution_node_service
 from app.services import jmeter_runner
 from app.services import report as report_service
-from app.core.jmeter_xml import csv_ignore_first_line, list_thread_groups, update_csv_filenames, update_run_thread
+from app.core.jmeter_xml import (
+    csv_ignore_first_line,
+    list_thread_groups,
+    update_csv_filenames,
+    update_run_thread,
+    update_upload_file_paths,
+)
 
 log = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -143,7 +151,7 @@ async def update_testcase(
 
     sent = param.model_dump(exclude_unset=True, exclude_none=True, by_alias=False)
 
-    # 改名时级联更新关联的 JMX/CSV/JAR 的 description（对齐 Java 行为）
+    # 改名时级联更新关联资源的 description（对齐 Java 行为）
     new_name = sent.get("name")
     name_changed = new_name is not None and new_name != existing.name
     if name_changed:
@@ -159,7 +167,7 @@ async def update_testcase(
 async def _cascade_description_on_rename(
     db: AsyncSession, testcase_id: int, new_name: str, user: UserContext
 ) -> None:
-    """用例改名 → 同步 JMX/CSV/JAR 的 description = 新名字"""
+    """用例改名 → 同步 JMX/CSV/JAR/上传文件的 description = 新名字"""
     jmx = await jmx_crud.get_by_test_case_id(db, testcase_id)
     if jmx is not None:
         jmx.description = new_name
@@ -175,6 +183,11 @@ async def _cascade_description_on_rename(
         jar_obj.description = new_name
         stamp_modify(jar_obj, user)
         await jar_crud.update(db, jar_obj)
+
+    for upload_obj in await upload_file_crud.get_by_test_case_id(db, testcase_id):
+        upload_obj.description = new_name
+        stamp_modify(upload_obj, user)
+        await upload_file_crud.update(db, upload_obj)
 
 
 async def delete_testcase(db: AsyncSession, id: int) -> bool:
@@ -217,6 +230,8 @@ async def get_testcase_list(
         service=query.service,
         offset=offset,
         limit=query.size,
+        sort_by=query.sort_by,
+        sort_order=query.sort_order,
     )
     page_vo.list = [_to_vo(t) for t in items]
     return page_vo
@@ -361,7 +376,8 @@ async def _sync_case_dependencies_to_slaves(
         return
     csvs = await csv_crud.get_by_test_case_id(db, testcase_id)
     jars = await jar_crud.get_by_test_case_id(db, testcase_id)
-    if not csvs and not jars:
+    upload_files = await upload_file_crud.get_by_test_case_id(db, testcase_id)
+    if not csvs and not jars and not upload_files:
         return
 
     for slave in slaves:
@@ -387,6 +403,16 @@ async def _sync_case_dependencies_to_slaves(
                 raise MysteriousException(
                     Codes.FAIL,
                     message=f"压力机「{slave.host}」同步JAR文件失败: {jar_obj.src_name}",
+                ) from e
+        for upload_obj in upload_files:
+            local_path = upload_obj.file_dir + upload_obj.dst_name
+            try:
+                await ssh.scp_file(local_path, upload_obj.file_dir, raise_on_error=True)
+            except MysteriousException as e:
+                log.warning("执行前同步上传文件到 slave %s 失败: %s", slave.host, local_path)
+                raise MysteriousException(
+                    Codes.FAIL,
+                    message=f"压力机「{slave.host}」同步上传文件失败: {upload_obj.src_name}",
                 ) from e
 
 
@@ -783,6 +809,11 @@ async def _run_testcase_now(
         duration,
         thread_group_overrides,
     )
+    upload_files = await upload_file_crud.get_by_test_case_id(db, id)
+    update_upload_file_paths(
+        run_jmx_path,
+        {item.src_name: item.file_dir + item.dst_name for item in upload_files},
+    )
 
     # 清理旧 run_*.jmx，只保留最近 5 个
     _cleanup_old_run_jmx(jmx.jmx_dir, id, keep=5)
@@ -1164,11 +1195,13 @@ async def get_full_vo(db: AsyncSession, id: int) -> TestCaseFullVO | None:
     jmx = await jmx_crud.get_by_test_case_id(db, id)
     csvs = await csv_crud.get_by_test_case_id(db, id)
     jars = await jar_crud.get_by_test_case_id(db, id)
+    upload_files = await upload_file_crud.get_by_test_case_id(db, id)
     return TestCaseFullVO(
         **TestCaseVO.model_validate(testcase).model_dump(by_alias=False),
         jmx_vo=JmxVO.model_validate(jmx) if jmx else None,
         csv_vo_list=[CsvVO.model_validate(o) for o in csvs],
         jar_vo_list=[JarVO.model_validate(o) for o in jars],
+        upload_file_vo_list=[UploadFileVO.model_validate(o) for o in upload_files],
     )
 
 
@@ -1189,6 +1222,8 @@ async def sync_node(db: AsyncSession, node_id: int, user: UserContext) -> bool:
             files.append(("CSV", csv_obj.src_name, csv_obj.csv_dir + csv_obj.dst_name, csv_obj.csv_dir))
         for jar_obj in await jar_crud.get_by_test_case_id(db, tc.id):
             files.append(("JAR", jar_obj.src_name, jar_obj.jar_dir + jar_obj.dst_name, jar_obj.jar_dir))
+        for upload_obj in await upload_file_crud.get_by_test_case_id(db, tc.id):
+            files.append(("上传文件", upload_obj.src_name, upload_obj.file_dir + upload_obj.dst_name, upload_obj.file_dir))
     log.info("syncNode node=%s host=%s files=%d", node_id, node.host, len(files))
     await _sync_dependency_files_to_slave(node, files)
     return True

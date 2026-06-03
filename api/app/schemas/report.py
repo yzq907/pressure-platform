@@ -63,6 +63,7 @@ class ReportQuery(BaseQuery):
 
     name: str | None = None
     region: str | None = None
+    exec_type: int | None = None
 
 
 class ReportByTestCaseQuery(BaseQuery):
@@ -71,6 +72,7 @@ class ReportByTestCaseQuery(BaseQuery):
     name: str | None = None
     test_case_id: int | None = None
     region: str | None = None
+    exec_type: int | None = None
 
 
 class MetricsVO(CamelModel):

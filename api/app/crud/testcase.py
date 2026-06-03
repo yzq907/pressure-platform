@@ -9,6 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.testcase import TestCase
 
 
+_SORT_FIELDS = {
+    "id": TestCase.id,
+    "createTime": TestCase.create_time,
+    "modifyTime": TestCase.modify_time,
+}
+
+
 async def get_by_id(db: AsyncSession, id: int) -> TestCase | None:
     return await db.get(TestCase, id)
 
@@ -105,6 +112,8 @@ async def list_testcases(
     service: str | None,
     offset: int,
     limit: int,
+    sort_by: str = "id",
+    sort_order: str = "desc",
 ) -> list[TestCase]:
     stmt = _apply_filters(
         select(TestCase),
@@ -114,7 +123,11 @@ async def list_testcases(
         biz=biz,
         service=service,
     )
-    stmt = stmt.order_by(TestCase.modify_time.desc()).offset(offset).limit(limit)
+    sort_column = _SORT_FIELDS.get(sort_by, TestCase.id)
+    direction = sort_order if sort_order in ("asc", "desc") else "desc"
+    order_expr = sort_column.asc() if direction == "asc" else sort_column.desc()
+    id_tiebreaker = TestCase.id.asc() if direction == "asc" else TestCase.id.desc()
+    stmt = stmt.order_by(order_expr, id_tiebreaker).offset(offset).limit(limit)
     return list((await db.execute(stmt)).scalars().all())
 
 

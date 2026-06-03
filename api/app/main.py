@@ -24,6 +24,7 @@ from app.api.v1.report import router as report_router
 from app.api.v1.role import router as role_router
 from app.api.v1.scheduled_task import router as scheduled_task_router
 from app.api.v1.testcase import router as testcase_router
+from app.api.v1.upload_file import router as upload_file_router
 from app.api.v1.user import router as user_router
 from app.core.config import get_settings
 from app.core.exceptions import register_exception_handlers
@@ -132,6 +133,7 @@ async def lifespan(app: FastAPI):
         ensure_rbac_schema,
         ensure_report_snapshot_columns,
         ensure_scheduled_task_log_table,
+        ensure_upload_file_table,
     )
     await ensure_ai_generation_tables()
     await ensure_report_snapshot_columns()
@@ -142,6 +144,7 @@ async def lifespan(app: FastAPI):
     await ensure_execution_run_table()
     await ensure_execution_node_table()
     await ensure_report_metric_snapshot_table()
+    await ensure_upload_file_table()
 
     # 初始化：创建 admin 用户（如不存在）
     async with session_module.AsyncSessionLocal() as db:
@@ -208,6 +211,7 @@ def create_app() -> FastAPI:
     app.include_router(testcase_router)
     app.include_router(jmx_router)
     app.include_router(csv_router)
+    app.include_router(upload_file_router)
     app.include_router(jar_router)
     app.include_router(report_router)
     app.include_router(role_router)

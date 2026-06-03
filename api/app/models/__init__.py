@@ -25,6 +25,7 @@ from app.models.role import Role, RolePermission
 from app.models.scheduled_task import ScheduledTask
 from app.models.scheduled_task_log import ScheduledTaskLog
 from app.models.testcase import TestCase
+from app.models.upload_file import UploadFileResource
 from app.models.user import User
 
 __all__ = [
@@ -55,5 +56,6 @@ __all__ = [
     "ScheduledTask",
     "ScheduledTaskLog",
     "TestCase",
+    "UploadFileResource",
     "User",
 ]

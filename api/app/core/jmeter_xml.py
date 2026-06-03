@@ -166,6 +166,37 @@ def update_csv_filenames(jmx_path: str, csv_path_by_filename: dict[str, str]) ->
     _write(tree, jmx_path)
 
 
+def _http_file_arg_path_props(tree: etree._ElementTree):
+    for file_arg in tree.iter("elementProp"):
+        if file_arg.get("elementType") != "HTTPFileArg":
+            continue
+        for prop in file_arg.iter():
+            if prop.get("name") == "File.path":
+                yield prop
+
+
+def exist_upload_file_path(jmx_path: str, filename: str) -> bool:
+    """判断 JMX HTTP 文件上传配置里是否存在 basename 匹配 filename 的 File.path。"""
+    tree = _parse(jmx_path)
+    return any(_path_basename(prop.text or "") == filename for prop in _http_file_arg_path_props(tree))
+
+
+def update_upload_file_paths(jmx_path: str, file_path_by_filename: dict[str, str]) -> None:
+    """批量改写 HTTP 文件上传配置里的 File.path。
+
+    key 是用户在 JMX 里写的文件名，value 是平台保存后的绝对路径。只修改 HTTPFileArg
+    下的 File.path，避免误改普通参数、断言或脚本内容里的同名字符串。
+    """
+    if not file_path_by_filename:
+        return
+    tree = _parse(jmx_path)
+    for prop in _http_file_arg_path_props(tree):
+        basename = _path_basename(prop.text or "")
+        if basename in file_path_by_filename:
+            prop.text = file_path_by_filename[basename]
+    _write(tree, jmx_path)
+
+
 def update_jar_classpath(jmx_path: str, jar_dir: str) -> None:
     """找 <TestPlan>/<stringProp name=TestPlan.user_define_classpath>，改写为 jar_dir。
 

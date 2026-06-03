@@ -112,6 +112,39 @@ _CSV_COLUMNS = {
     },
 }
 
+
+async def ensure_upload_file_table() -> None:
+    """Create upload-file resource table for upgraded deployments."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        if "mysterious_upload_file" in tables:
+            return
+
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+        ddl = f"""
+        CREATE TABLE mysterious_upload_file (
+            id {id_type},
+            src_name varchar(255) NOT NULL DEFAULT '',
+            dst_name varchar(255) NOT NULL DEFAULT '',
+            description varchar(255) NOT NULL DEFAULT '',
+            file_dir varchar(255) NOT NULL DEFAULT '',
+            test_case_id bigint NOT NULL DEFAULT 0,
+            creator_id varchar(32) NOT NULL DEFAULT '',
+            creator varchar(32) NOT NULL DEFAULT '',
+            modifier_id varchar(32) NOT NULL DEFAULT '',
+            modifier varchar(32) NOT NULL DEFAULT '',
+            create_time {dt_default},
+            modify_time {dt_default},
+            PRIMARY KEY (id)
+        )
+        """
+        await conn.execute(text(ddl))
+        if dialect == "mysql":
+            await conn.execute(text("CREATE INDEX idx_test_case_id_upload_file ON mysterious_upload_file (test_case_id)"))
+        log.info("已创建 mysterious_upload_file 表")
+
 _USER_ROLE_COLUMNS = {
     "role_id": {
         "mysql": "bigint NOT NULL DEFAULT 0 COMMENT '用户角色ID'",

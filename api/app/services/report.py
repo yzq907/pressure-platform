@@ -101,12 +101,19 @@ async def get_by_id(db: AsyncSession, id: int) -> ReportVO | None:
 
 async def get_report_list(db: AsyncSession, query: ReportQuery) -> PageVO[ReportVO]:
     page_vo: PageVO[ReportVO] = PageVO(page=query.page, size=query.size, total=0, list=[])
-    total = await crud.count(db, name=query.name, region=query.region)
+    total = await crud.count(db, name=query.name, region=query.region, exec_type=query.exec_type)
     if total <= 0:
         return page_vo
     page_vo.total = total
     offset = PageVO.offset(query.page, query.size)
-    items = await crud.list_reports(db, name=query.name, region=query.region, offset=offset, limit=query.size)
+    items = await crud.list_reports(
+        db,
+        name=query.name,
+        region=query.region,
+        exec_type=query.exec_type,
+        offset=offset,
+        limit=query.size,
+    )
     page_vo.list = await _to_vo_list_with_occupied_nodes(db, items)
     return page_vo
 
@@ -115,20 +122,35 @@ async def get_report_list_by_test_case(
     db: AsyncSession, query: ReportByTestCaseQuery
 ) -> PageVO[ReportVO]:
     page_vo: PageVO[ReportVO] = PageVO(page=query.page, size=query.size, total=0, list=[])
-    total = await crud.count(db, name=query.name, test_case_id=query.test_case_id)
+    total = await crud.count(
+        db,
+        name=query.name,
+        test_case_id=query.test_case_id,
+        exec_type=query.exec_type,
+    )
     if total <= 0:
         return page_vo
     page_vo.total = total
     offset = PageVO.offset(query.page, query.size)
     items = await crud.list_by_test_case(
-        db, name=query.name, test_case_id=query.test_case_id, offset=offset, limit=query.size
+        db,
+        name=query.name,
+        test_case_id=query.test_case_id,
+        exec_type=query.exec_type,
+        offset=offset,
+        limit=query.size,
     )
     page_vo.list = await _to_vo_list_with_occupied_nodes(db, items)
     return page_vo
 
 
 async def get_report_stats(db: AsyncSession, query: ReportQuery) -> ReportStatsVO:
-    counts = await crud.count_by_status(db, name=query.name, region=query.region)
+    counts = await crud.count_by_status(
+        db,
+        name=query.name,
+        region=query.region,
+        exec_type=query.exec_type,
+    )
     success = counts.get(2, 0)
     failed = counts.get(3, 0)
     executed = success + failed
