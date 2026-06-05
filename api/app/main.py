@@ -125,16 +125,20 @@ async def lifespan(app: FastAPI):
 
     from app.db.schema import (
         ensure_ai_generation_tables,
+        ensure_config_value_text_column,
         ensure_csv_distribution_columns,
         ensure_execution_node_table,
         ensure_execution_queue_table,
         ensure_execution_run_table,
         ensure_report_metric_snapshot_table,
+        ensure_report_transaction_metric_snapshot_table,
+        ensure_report_transaction_snapshot_table,
         ensure_rbac_schema,
         ensure_report_snapshot_columns,
         ensure_scheduled_task_log_table,
         ensure_upload_file_table,
     )
+    await ensure_config_value_text_column()
     await ensure_ai_generation_tables()
     await ensure_report_snapshot_columns()
     await ensure_csv_distribution_columns()
@@ -144,11 +148,15 @@ async def lifespan(app: FastAPI):
     await ensure_execution_run_table()
     await ensure_execution_node_table()
     await ensure_report_metric_snapshot_table()
+    await ensure_report_transaction_snapshot_table()
+    await ensure_report_transaction_metric_snapshot_table()
     await ensure_upload_file_table()
 
     # 初始化：创建 admin 用户（如不存在）
     async with session_module.AsyncSessionLocal() as db:
+        from app.services.config import ensure_default_configs
         from app.services.user import ensure_admin_user
+        await ensure_default_configs(db)
         await ensure_admin_user(db)
 
     # 启动自愈：修复上次异常退出时残留的 RUN_ING 状态

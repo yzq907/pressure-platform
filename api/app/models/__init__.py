@@ -21,6 +21,8 @@ from app.models.jmx_thread_group import JmxThreadGroup
 from app.models.node import Node
 from app.models.report import Report
 from app.models.report_metric_snapshot import ReportMetricSnapshot
+from app.models.report_transaction_metric_snapshot import ReportTransactionMetricSnapshot
+from app.models.report_transaction_snapshot import ReportTransactionSnapshot
 from app.models.role import Role, RolePermission
 from app.models.scheduled_task import ScheduledTask
 from app.models.scheduled_task_log import ScheduledTaskLog
@@ -51,6 +53,8 @@ __all__ = [
     "Node",
     "Report",
     "ReportMetricSnapshot",
+    "ReportTransactionMetricSnapshot",
+    "ReportTransactionSnapshot",
     "Role",
     "RolePermission",
     "ScheduledTask",

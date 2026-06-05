@@ -67,6 +67,20 @@ def _set_named_props(parent: Any, name_to_value: dict[str, str]) -> None:
             child.text = name_to_value[name]
 
 
+def _first_named_prop_text(parent: Any, prop_name: str) -> str | None:
+    for child in parent.iter():
+        if child.get("name") == prop_name:
+            return child.text
+    return None
+
+
+def _to_non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _parse(jmx_path: str) -> etree._ElementTree:
     """解析 JMX；remove_blank_text=False 以保留原始空白"""
     parser = etree.XMLParser(remove_blank_text=False)
@@ -228,6 +242,23 @@ def list_thread_groups(jmx_path: str) -> list[dict[str, str]]:
     return groups
 
 
+def sum_enabled_thread_group_threads(jmx_path: str) -> int:
+    """统计最终 JMX 中所有启用线程组的线程数总和。"""
+    tree = _parse(jmx_path)
+    total = 0
+    for el in tree.iter():
+        if not _is_enabled(el):
+            continue
+        group_type = _thread_group_type(el)
+        if not group_type:
+            continue
+        if group_type == "concurrency_thread_group":
+            total += _to_non_negative_int(_first_named_prop_text(el, "TargetLevel"))
+        else:
+            total += _to_non_negative_int(_first_named_prop_text(el, "ThreadGroup.num_threads"))
+    return total
+
+
 def _thread_group_key(el: Any, index: int) -> tuple[str, str] | None:
     group_type = _thread_group_type(el)
     if not group_type:
@@ -241,6 +272,191 @@ def _thread_group_type(el: Any) -> str | None:
     if el.tag in (_STEPPING_TG, _CONCURRENCY_TG):
         return _THREAD_GROUP_TYPE_BY_TAG[el.tag]
     return None
+
+
+def _is_thread_group(el: Any) -> bool:
+    return _thread_group_type(el) is not None
+
+
+def _is_transaction_controller(el: Any) -> bool:
+    return el.tag == "TransactionController" and (el.get("testclass") in (None, "TransactionController"))
+
+
+def _pairs_in_hash_tree(hash_tree: Any):
+    children = list(hash_tree)
+    index = 0
+    while index < len(children):
+        node = children[index]
+        child_hash = children[index + 1] if index + 1 < len(children) and children[index + 1].tag == "hashTree" else None
+        yield node, child_hash
+        index += 2 if child_hash is not None else 1
+
+
+def _walk_jmeter_pairs(hash_tree: Any, thread_group_name: str = ""):
+    for node, child_hash in _pairs_in_hash_tree(hash_tree):
+        current_thread_group = thread_group_name
+        if _is_thread_group(node):
+            current_thread_group = node.get("testname") or ""
+        yield node, child_hash, current_thread_group, hash_tree
+        if child_hash is not None:
+            yield from _walk_jmeter_pairs(child_hash, current_thread_group)
+
+
+def list_transactions(jmx_path: str) -> list[dict[str, str]]:
+    """列出 JMX 中可配置占比的交易目标。
+
+    优先返回 TransactionController。若脚本没有 TransactionController，则把
+    ThreadGroup 作为交易目标兜底，适配“一个线程组一个交易”的脚本结构。
+    """
+    tree = _parse(jmx_path)
+    root_hash = tree.getroot().find("hashTree")
+    if root_hash is None:
+        return []
+
+    transactions: list[dict[str, str]] = []
+    for node, _child_hash, thread_group_name, _parent_hash in _walk_jmeter_pairs(root_hash):
+        if not _is_transaction_controller(node):
+            continue
+        transactions.append({
+            "key": f"transaction:{len(transactions)}",
+            "name": node.get("testname") or "",
+            "thread_group": thread_group_name,
+            "enabled": _is_enabled(node),
+        })
+    if transactions:
+        return transactions
+
+    thread_groups: list[dict[str, str]] = []
+    for node, _child_hash, _thread_group_name, _parent_hash in _walk_jmeter_pairs(root_hash):
+        indexed = _thread_group_key(node, len(thread_groups))
+        if not indexed:
+            continue
+        key, _group_type = indexed
+        name = node.get("testname") or ""
+        thread_groups.append({
+            "key": key,
+            "name": name,
+            "thread_group": name,
+            "enabled": _is_enabled(node),
+        })
+    return thread_groups
+
+
+def _transaction_config_key(item: dict[str, Any]) -> str:
+    return str(item.get("key") or item.get("name") or "").strip()
+
+
+def _transaction_config_by_key(items: list[dict] | None) -> dict[str, dict]:
+    configs: dict[str, dict] = {}
+    for item in items or []:
+        key = _transaction_config_key(item)
+        if key and _as_bool(item.get("enabled", True)):
+            configs[key] = item
+    return configs
+
+
+def _format_integer(value: Any) -> str:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        number = 0
+    return str(max(0, number))
+
+
+_PACING_CYCLE_TIMER_SCRIPT = """long pacingMs = 0L
+try {
+    pacingMs = Long.parseLong((Parameters ?: "0").trim())
+} catch (Throwable ignored) {
+    pacingMs = 0L
+}
+
+if (pacingMs <= 0L) {
+    return 0L
+}
+
+String groupName = ctx.getThreadGroup() == null ? "default" : ctx.getThreadGroup().getName()
+String key = "platform_pacing_next_start_" + groupName
+Long nextStart = vars.getObject(key) as Long
+long now = System.currentTimeMillis()
+
+if (nextStart == null) {
+    vars.putObject(key, now + pacingMs)
+    return 0L
+}
+
+long delay = Math.max(0L, nextStart - now)
+long scheduledStart = now + delay
+vars.putObject(key, scheduledStart + pacingMs)
+return delay
+"""
+
+
+def _jsr223_cycle_timer(name: str, pacing_ms: Any) -> Any:
+    timer = etree.Element(
+        "JSR223Timer",
+        guiclass="TestBeanGUI",
+        testclass="JSR223Timer",
+        testname=f"平台Pacing_{name}",
+        enabled="true",
+    )
+    etree.SubElement(timer, "stringProp", name="cacheKey").text = "true"
+    etree.SubElement(timer, "stringProp", name="filename").text = ""
+    etree.SubElement(timer, "stringProp", name="parameters").text = _format_integer(pacing_ms)
+    etree.SubElement(timer, "stringProp", name="script").text = _PACING_CYCLE_TIMER_SCRIPT
+    etree.SubElement(timer, "stringProp", name="scriptLanguage").text = "groovy"
+    return timer
+
+
+def _insert_timer_at_scope_start(scope_hash: Any, timer: Any) -> None:
+    scope_hash.insert(0, etree.Element("hashTree"))
+    scope_hash.insert(0, timer)
+
+
+def apply_thread_group_pacing(
+    jmx_path: str,
+    dest_path: str,
+    thread_group_overrides: list[dict[str, Any]] | None,
+) -> None:
+    """按线程组配置插入 JSR223 周期 Timer。pacing_ms <= 0 时不插入。
+
+    update_run_thread 已负责线程组启停、并发、运行时长。这里只处理 Pacing。
+    """
+    tree = _parse(jmx_path)
+    root_hash = tree.getroot().find("hashTree")
+    if root_hash is None:
+        _write(tree, dest_path)
+        return
+
+    overrides = _transaction_config_by_key(thread_group_overrides)
+    if not overrides:
+        _write(tree, dest_path)
+        return
+
+    thread_group_index = 0
+    for node, child_hash, _thread_group_name, parent_hash in _walk_jmeter_pairs(root_hash):
+        indexed = _thread_group_key(node, thread_group_index)
+        if not indexed:
+            continue
+        key, _group_type = indexed
+        thread_group_index += 1
+        override = overrides.get(key) or overrides.get(node.get("testname") or "")
+        if override is None or child_hash is None:
+            continue
+        if str(override.get("name") or node.get("testname") or "") != (node.get("testname") or ""):
+            continue
+        try:
+            pacing_ms = int(override.get("pacing_ms") or 0)
+        except (TypeError, ValueError):
+            pacing_ms = 0
+        if pacing_ms <= 0 or not _is_enabled(node):
+            continue
+        timer = _jsr223_cycle_timer(
+            node.get("testname") or "未命名线程组",
+            pacing_ms,
+        )
+        _insert_timer_at_scope_start(child_hash, timer)
+
+    _write(tree, dest_path)
 
 
 def _override_key(item: dict[str, str]) -> str:
@@ -271,7 +487,7 @@ def _resolve_thread_values(
         return (
             str(override.get("num_threads") or num_threads),
             str(override.get("ramp_time") or ramp_time),
-            str(override.get("duration") or duration),
+            duration,
         )
     return num_threads, ramp_time, duration
 

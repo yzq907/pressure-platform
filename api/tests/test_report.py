@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -15,8 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.enums import ExecType, TestCaseStatus
 from app.models.config import Config
 from app.models.execution_node import ExecutionNode
+from app.models.execution_run import ExecutionRun
 from app.models.report import Report
 from app.models.report_metric_snapshot import ReportMetricSnapshot
+from app.models.report_transaction_metric_snapshot import ReportTransactionMetricSnapshot
 from app.models.testcase import TestCase
 from app.services import report as report_service
 from app.services.report import _parse_jtl_metrics
@@ -169,6 +173,838 @@ async def test_report_get_by_id(auth_client: AsyncClient, db: AsyncSession) -> N
     assert item["slaveCount"] == 2
     assert item["grafanaInstance"] == "10.10.27.42:9200"
     assert item["artifactDir"] == "/tmp/r/artifacts"
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_queries_prometheus(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics",
+        exec_type=ExecType.EXEC.value,
+        grafana_instance="10.10.27.42:9200",
+    )
+    captured: list[dict] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append({
+            "base_url": base_url,
+            "query": query,
+            "start": start,
+            "end": end,
+            "step": step,
+            "timeout": timeout,
+        })
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
+
+    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    body = resp.json()
+
+    assert body["code"] == 0
+    data = body["data"]
+    assert data["reportId"] == rid
+    assert data["instance"] == "10.10.27.42:9200"
+    assert data["step"] == 30
+    assert data["series"]["cpu"][0]["value"] == 12.5
+    assert captured
+    assert all(item["base_url"] == "http://prometheus.example" for item in captured)
+    assert any('instance="10.10.27.42:9200"' in item["query"] for item in captured)
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_uses_configured_step_when_request_omits_step(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    db.add(Config(config_key="PROMETHEUS_STEP_SECONDS", config_value="45"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-config-step",
+        exec_type=ExecType.EXEC.value,
+        grafana_instance="10.10.27.42:9200",
+    )
+    captured: list[int] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append(step)
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
+
+    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"]["step"] == 45
+    assert captured
+    assert set(captured) == {45}
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_queries_prometheus_metrics_concurrently(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-concurrent",
+        exec_type=ExecType.EXEC.value,
+        grafana_instance="10.10.27.42:9200",
+    )
+    active = 0
+    max_active = 0
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
+
+    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert set(body["data"]["series"]) == set(report_service.DEFAULT_PROMETHEUS_RESOURCE_METRICS)
+    assert max_active > 1
+
+
+@pytest.mark.asyncio
+async def test_report_resource_targets_from_resource_group_map(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    db.add(
+        Config(
+            config_key="PROMETHEUS_RESOURCE_GROUP_MAP",
+            config_value=json.dumps(
+                {
+                    "EMM-API": {
+                        "name": "EMM-API压测资源组",
+                        "targets": [
+                            {
+                                "name": "EMM-API",
+                                "role": "被压服务",
+                                "service": "EMM-API",
+                                "instance": "10.10.27.42:9200",
+                            },
+                            {
+                                "name": "EMM-CORE",
+                                "role": "依赖服务",
+                                "service": "EMM-CORE",
+                                "instance": "10.10.27.43:9200",
+                            },
+                            {
+                                "name": "MYSQL",
+                                "role": "数据库",
+                                "service": "MYSQL",
+                                "instance": "10.8.83.145:9200",
+                            },
+                        ],
+                    }
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    await db.commit()
+    rid = await _insert_report(db, name="emm-api-run", service_name="EMM-API")
+
+    resp = await auth_client.get(f"/report/resourceTargets/{rid}")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"] == [
+        {
+            "name": "EMM-API",
+            "role": "被压服务",
+            "service": "EMM-API",
+            "instance": "10.10.27.42:9200",
+        },
+        {
+            "name": "EMM-CORE",
+            "role": "依赖服务",
+            "service": "EMM-CORE",
+            "instance": "10.10.27.43:9200",
+        },
+        {
+            "name": "MYSQL",
+            "role": "数据库",
+            "service": "MYSQL",
+            "instance": "10.8.83.145:9200",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_resource_targets_fallback_to_single_instance(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    rid = await _insert_report(
+        db,
+        name="single-target-run",
+        service_name="EMM-API",
+        grafana_instance="10.10.27.42:9200",
+    )
+
+    resp = await auth_client.get(f"/report/resourceTargets/{rid}")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"] == [
+        {
+            "name": "EMM-API",
+            "role": "被压服务",
+            "service": "EMM-API",
+            "instance": "10.10.27.42:9200",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_uses_requested_instance(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-requested-instance",
+        exec_type=ExecType.EXEC.value,
+        grafana_instance="10.10.27.42:9200",
+    )
+    captured: list[dict] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append({"query": query, "step": step})
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 1.0}]
+
+    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+
+    resp = await auth_client.get(
+        f"/report/resourceMetrics/{rid}",
+        params={"instance": "10.10.27.43:9200", "step": 60},
+    )
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"]["instance"] == "10.10.27.43:9200"
+    assert body["data"]["step"] == 60
+    assert any('instance="10.10.27.43:9200"' in item["query"] for item in captured)
+    assert not any('instance="10.10.27.42:9200"' in item["query"] for item in captured)
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_prefers_prometheus_map_over_grafana_snapshot(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    db.add(
+        Config(
+            config_key="PROMETHEUS_INSTANCE_MAP",
+            config_value='{"EMM-API":"10.10.27.43:9200"}',
+        )
+    )
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-prometheus-map",
+        exec_type=ExecType.EXEC.value,
+        service_name="EMM-API",
+        grafana_instance="10.10.27.42:9200",
+    )
+    captured: list[str] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append(query)
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 1.0}]
+
+    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"]["instance"] == "10.10.27.43:9200"
+    assert any('instance="10.10.27.43:9200"' in item for item in captured)
+    assert not any('instance="10.10.27.42:9200"' in item for item in captured)
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_uses_execution_run_time_range(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-run-time",
+        exec_type=ExecType.EXEC.value,
+        service_name="EMM-API",
+        grafana_instance="10.10.27.42:9200",
+    )
+    report = await db.get(Report, rid)
+    assert report is not None
+    report.create_time = datetime(2026, 6, 3, 11, 41, 21)
+    report.modify_time = datetime(2026, 6, 3, 11, 41, 21)
+    db.add(
+        ExecutionRun(
+            report_id=rid,
+            test_case_id=report.test_case_id,
+            status="success",
+            started_at=datetime(2026, 6, 3, 11, 41, 21),
+            finished_at=datetime(2026, 6, 3, 11, 51, 48),
+        )
+    )
+    await db.commit()
+    captured: list[dict] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append({"start": start, "end": end})
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 1.0}]
+
+    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    data = resp.json()["data"]
+
+    expected_from = report_service._to_epoch_ms(datetime(2026, 6, 3, 11, 41, 21) - timedelta(minutes=15))
+    expected_to = report_service._to_epoch_ms(datetime(2026, 6, 3, 11, 51, 48) + timedelta(minutes=15))
+    assert data["fromMs"] == expected_from
+    assert data["toMs"] == expected_to
+    assert captured
+    assert all(item["start"] == expected_from // 1000 for item in captured)
+    assert all(item["end"] == expected_to // 1000 for item in captured)
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_caps_prometheus_query_end_to_stable_now(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    db.add(Config(config_key="GRAFANA_FROM_OFFSET_MINUTES", config_value="5"))
+    db.add(Config(config_key="GRAFANA_TO_OFFSET_MINUTES", config_value="5"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-cap-future",
+        exec_type=ExecType.EXEC.value,
+        service_name="EMM-API",
+        grafana_instance="10.10.27.42:9200",
+    )
+    report = await db.get(Report, rid)
+    assert report is not None
+    db.add(
+        ExecutionRun(
+            report_id=rid,
+            test_case_id=report.test_case_id,
+            status="success",
+            started_at=datetime(2026, 6, 4, 15, 47, 34),
+            finished_at=datetime(2026, 6, 4, 15, 52, 46),
+        )
+    )
+    await db.commit()
+    captured: list[dict] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append({"start": start, "end": end, "step": step})
+        return [{"timestamp": "15:54:00", "timestamp_ms": 1780559640000, "value": 1.0}]
+
+    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(
+        report_service.time,
+        "time",
+        lambda: report_service._to_epoch_ms(datetime(2026, 6, 4, 15, 55, 0)) / 1000,
+    )
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    data = resp.json()["data"]
+
+    expected_to = report_service._to_epoch_ms(datetime(2026, 6, 4, 15, 57, 46))
+    stable_query_end = report_service._to_epoch_ms(datetime(2026, 6, 4, 15, 54, 0)) // 1000
+    assert data["toMs"] == expected_to
+    assert captured
+    assert all(item["end"] == stable_query_end for item in captured)
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_requires_prometheus_config(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    rid = await _insert_report(db, name="resource-no-config", exec_type=ExecType.EXEC.value)
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}")
+    body = resp.json()
+
+    assert body["code"] == -1
+    assert "PROMETHEUS_BASE_URL" in body["message"]
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_stats_reads_jmeter_statistics_json(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_dir = tmp_path / "2026-06-04-10:00:00" / "data"
+    report_dir.mkdir(parents=True)
+    (report_dir / "statistics.json").write_text(
+        json.dumps(
+            {
+                "Total": {
+                    "transaction": "Total",
+                    "sampleCount": 100,
+                    "errorCount": 3,
+                    "meanResTime": 120.5,
+                    "minResTime": 20.0,
+                    "maxResTime": 900.0,
+                    "throughput": 10.25,
+                },
+                "login": {
+                    "transaction": "login",
+                    "sampleCount": 40,
+                    "errorCount": 1,
+                    "meanResTime": 80.0,
+                    "minResTime": 15.0,
+                    "maxResTime": 300.0,
+                    "throughput": 4.0,
+                },
+                "query": {
+                    "transaction": "query",
+                    "sampleCount": 60,
+                    "errorCount": 2,
+                    "meanResTime": 147.5,
+                    "minResTime": 30.0,
+                    "maxResTime": 900.0,
+                    "throughput": 6.25,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-statistics-json",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+
+    resp = await auth_client.get(f"/report/transactionStats/{rid}")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"] == [
+        {
+            "name": "Total",
+            "samples": 100,
+            "success": 97,
+            "failed": 3,
+            "successRate": 97.0,
+            "tps": 10.25,
+            "avgRt": 120.5,
+            "maxRt": 900.0,
+            "minRt": 20.0,
+            "ratio": 100.0,
+        },
+        {
+            "name": "login",
+            "samples": 40,
+            "success": 39,
+            "failed": 1,
+            "successRate": 97.5,
+            "tps": 4.0,
+            "avgRt": 80.0,
+            "maxRt": 300.0,
+            "minRt": 15.0,
+            "ratio": 40.0,
+        },
+        {
+            "name": "query",
+            "samples": 60,
+            "success": 58,
+            "failed": 2,
+            "successRate": 96.67,
+            "tps": 6.25,
+            "avgRt": 147.5,
+            "maxRt": 900.0,
+            "minRt": 30.0,
+            "ratio": 60.0,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_stats_fallbacks_to_jtl_grouped_by_label(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-06-04-11:00:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads",
+                "1700000000000,100,login,true,1,1",
+                "1700000001000,200,login,false,1,1",
+                "1700000002000,300,query,true,1,1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-jtl",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+
+    resp = await auth_client.get(f"/report/transactionStats/{rid}")
+    data = resp.json()["data"]
+
+    assert [item["name"] for item in data] == ["Total", "login", "query"]
+    assert data[0]["samples"] == 3
+    assert data[0]["success"] == 2
+    assert data[0]["failed"] == 1
+    assert data[1]["samples"] == 2
+    assert data[1]["successRate"] == 50.0
+    assert data[1]["avgRt"] == 150.0
+    assert data[1]["ratio"] == 66.67
+    assert data[2]["samples"] == 1
+    assert data[2]["ratio"] == 33.33
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_metrics_groups_jtl_by_label_and_time_window(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-06-04-12:00:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads,threadName",
+                "1700000000000,100,login,true,1,1,t-1",
+                "1700000001000,300,login,false,1,1,t-2",
+                "1700000060000,200,login,true,1,1,t-1",
+                "1700000002000,80,query,true,1,1,t-1",
+                "1700000061000,120,query,true,1,1,t-3",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-metrics-jtl",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+
+    resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
+    body = resp.json()
+
+    assert body["code"] == 0
+    data = body["data"]
+    assert data["reportId"] == rid
+    assert data["window"] == 60
+    assert data["transactions"] == ["login", "query"]
+    assert data["series"]["login"] == [
+        {
+            "timestamp": "06:13:00",
+            "qps": 0.03,
+            "avgRt": 200.0,
+            "p95Rt": 290.0,
+            "p99Rt": 298.0,
+            "errorRate": 50.0,
+            "sampleCount": 2,
+            "failCount": 1,
+            "activeThreads": 2,
+        },
+        {
+            "timestamp": "06:14:00",
+            "qps": 0.02,
+            "avgRt": 200.0,
+            "p95Rt": 200.0,
+            "p99Rt": 200.0,
+            "errorRate": 0.0,
+            "sampleCount": 1,
+            "failCount": 0,
+            "activeThreads": 1,
+        },
+    ]
+    assert data["series"]["query"][0]["avgRt"] == 80.0
+    assert data["series"]["query"][1]["avgRt"] == 120.0
+
+    rows = (
+        await db.execute(
+            select(ReportTransactionMetricSnapshot).where(
+                ReportTransactionMetricSnapshot.report_id == rid
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 4
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_metrics_prefers_group_threads_without_thread_name(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-06-04-12:15:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads",
+                "1700000000000,100,login,true,8,4",
+                "1700000001000,300,login,true,9,4",
+                "1700000002000,80,query,true,10,4",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-metrics-no-thread-name",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+
+    resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
+    body = resp.json()
+
+    assert body["code"] == 0
+    data = body["data"]
+    assert data["series"]["login"][0]["activeThreads"] == 4
+    assert data["series"]["query"][0]["activeThreads"] == 4
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_metrics_fallbacks_to_all_threads_when_group_threads_missing(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-06-04-12:18:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads",
+                "1700000000000,100,login,true,8,",
+                "1700000001000,300,login,true,9,0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-metrics-no-group-threads",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+
+    resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"]["series"]["login"][0]["activeThreads"] == 9
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_metrics_regenerates_zero_active_thread_snapshots(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-06-04-12:20:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads",
+                "1700000000000,100,login,true,7,3",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-metrics-zero-backfill",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+    db.add(
+        ReportTransactionMetricSnapshot(
+            report_id=rid,
+            transaction_name="login",
+            window_sec=60,
+            bucket_start_ms=1699999980000,
+            timestamp="06:13:00",
+            qps=0.02,
+            avg_rt=100,
+            sample_count=1,
+            active_threads=0,
+        )
+    )
+    await db.commit()
+
+    resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"]["series"]["login"][0]["activeThreads"] == 3
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_metrics_regenerates_legacy_all_threads_snapshots(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-06-04-12:25:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads",
+                "1700000000000,100,login,true,30,5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-metrics-legacy-all-threads",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+    db.add(
+        ReportTransactionMetricSnapshot(
+            report_id=rid,
+            transaction_name="login",
+            window_sec=60,
+            bucket_start_ms=1699999980000,
+            timestamp="06:13:00",
+            qps=0.02,
+            avg_rt=100,
+            sample_count=1,
+            active_threads=30,
+            modifier_id="0",
+        )
+    )
+    await db.commit()
+
+    resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"]["series"]["login"][0]["activeThreads"] == 5
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_trend_returns_split_chart_data(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-06-04-12:30:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads,threadName",
+                "1700000000000,100,login,true,1,1,t-1",
+                "1700000001000,300,login,false,1,1,t-2",
+                "1700000002000,80,query,true,1,1,t-1",
+                "1700000060000,200,login,true,1,1,t-1",
+                "1700000061000,120,query,true,1,1,t-3",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-trend-jtl",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+
+    resp = await auth_client.get(f"/report/transactionTrend/{rid}?window=60")
+    body = resp.json()
+
+    assert body["code"] == 0
+    data = body["data"]
+    assert data["reportId"] == rid
+    assert data["window"] == 60
+    assert data["timestamps"] == ["06:13:00", "06:14:00"]
+    assert data["transactions"] == ["login", "query"]
+    assert data["totalTps"] == [
+        {"timestamp": "06:13:00", "value": 0.05},
+        {"timestamp": "06:14:00", "value": 0.03},
+    ]
+    assert data["transactionTps"]["login"][0] == {"timestamp": "06:13:00", "value": 0.03}
+    assert data["avgRt"]["login"][0] == {"timestamp": "06:13:00", "value": 200.0}
+    assert data["activeThreads"]["login"][0] == {"timestamp": "06:13:00", "value": 2}
+    assert data["activeThreads"]["query"][0] == {"timestamp": "06:13:00", "value": 1}
 
 
 @pytest.mark.asyncio

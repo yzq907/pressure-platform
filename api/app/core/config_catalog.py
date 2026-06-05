@@ -28,6 +28,7 @@ CATEGORIES: tuple[ConfigCategory, ...] = (
     ConfigCategory("business", "业务选项", 10),
     ConfigCategory("jmeter", "JMeter", 20),
     ConfigCategory("grafana", "Grafana", 30),
+    ConfigCategory("prometheus", "Prometheus", 35),
     ConfigCategory("report", "报告", 40),
     ConfigCategory("schedule", "调度", 50),
     ConfigCategory("init_data", "初始化数据", 60),
@@ -58,6 +59,15 @@ CONFIG_META: dict[str, ConfigMeta] = {
     "GRAFANA_INSTANCE_MAP": ConfigMeta("grafana", "服务Grafana实例映射", "json", 70),
     "GRAFANA_FROM_OFFSET_MINUTES": ConfigMeta("grafana", "Grafana开始时间偏移分钟", "number", 80),
     "GRAFANA_TO_OFFSET_MINUTES": ConfigMeta("grafana", "Grafana结束时间偏移分钟", "number", 90),
+    "PROMETHEUS_BASE_URL": ConfigMeta("prometheus", "Prometheus服务地址", "url", 10),
+    "PROMETHEUS_TIMEOUT_SECONDS": ConfigMeta("prometheus", "Prometheus查询超时时间秒", "number", 20),
+    "PROMETHEUS_STEP_SECONDS": ConfigMeta("prometheus", "Prometheus默认查询步长秒", "number", 30),
+    "PROMETHEUS_INSTANCE_LABEL": ConfigMeta("prometheus", "Prometheus实例标签名", "text", 40),
+    "PROMETHEUS_DEFAULT_INSTANCE": ConfigMeta("prometheus", "Prometheus默认实例", "text", 50),
+    "PROMETHEUS_INSTANCE_MAP": ConfigMeta("prometheus", "服务Prometheus实例映射", "json", 60),
+    "PROMETHEUS_RESOURCE_GROUP_MAP": ConfigMeta("prometheus", "Prometheus资源组映射", "json", 70),
+    "PROMETHEUS_FROM_OFFSET_MINUTES": ConfigMeta("prometheus", "Prometheus开始时间偏移分钟", "number", 80),
+    "PROMETHEUS_TO_OFFSET_MINUTES": ConfigMeta("prometheus", "Prometheus结束时间偏移分钟", "number", 90),
     "MASTER_DATA_HOME": ConfigMeta("report", "Master数据和报告目录", "path", 10),
     "MASTER_HOST_PORT": ConfigMeta("report", "报告预览Host", "text", 20),
     "INIT_ARTIFACT_TESTCASE_IDS": ConfigMeta("init_data", "初始化产物用例ID", "text", 10),
@@ -67,6 +77,10 @@ CONFIG_META: dict[str, ConfigMeta] = {
     "AI_JMX_SKILL_NAME": ConfigMeta("ai_generation", "JMX生成Skill名称", "text", 40),
     "REPORT_RETENTION_DAYS": ConfigMeta("retention", "测试报告保留天数", "number", 10),
     "AUDIT_RETENTION_DAYS": ConfigMeta("retention", "审计日志保留天数", "number", 20),
+}
+
+DEFAULT_CONFIG_VALUES: dict[str, str] = {
+    "PROMETHEUS_STEP_SECONDS": "30",
 }
 
 

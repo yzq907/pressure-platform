@@ -679,6 +679,8 @@ def _schedule_metric_snapshot(report_id: int) -> None:
     from app.services import report as report_service
 
     report_service.schedule_metric_snapshot_generation(report_id)
+    report_service.schedule_transaction_snapshot_generation(report_id)
+    report_service.schedule_transaction_metric_snapshot_generation(report_id)
 
 
 def _tail_for_log(value: str, limit: int = _LOG_TAIL_LIMIT) -> str:
@@ -738,6 +740,7 @@ async def _update_testcase_and_report(
             tc.status = status.value
         if rpt is not None:
             rpt.status = status.value
+            rpt.modify_time = _now()
             if response_data is not None:
                 rpt.response_data = response_data
             from app.services import execution_queue

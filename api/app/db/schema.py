@@ -11,6 +11,26 @@ from app.db.session import async_engine
 log = logging.getLogger(__name__)
 
 
+async def ensure_config_value_text_column() -> None:
+    """Allow JSON-style configuration values longer than 255 chars."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        if dialect != "mysql":
+            return
+        columns = await conn.run_sync(
+            lambda sync_conn: {
+                col["name"]: col for col in inspect(sync_conn).get_columns("mysterious_config")
+            }
+        )
+        column = columns.get("config_value")
+        if column is None:
+            return
+        if "text" in str(column.get("type", "")).lower():
+            return
+        await conn.execute(text("ALTER TABLE mysterious_config MODIFY COLUMN config_value text NOT NULL"))
+        log.info("已升级 mysterious_config.config_value 为 text")
+
+
 async def ensure_ai_generation_tables() -> None:
     """Create AI generation task/artifact tables for upgraded deployments."""
     async with async_engine.begin() as conn:
@@ -484,3 +504,136 @@ async def ensure_report_metric_snapshot_table() -> None:
             "ON mysterious_report_metric_snapshot (report_id, window_sec, bucket_start_ms)"
         ))
         log.info("已创建 mysterious_report_metric_snapshot 唯一索引")
+
+
+async def ensure_report_transaction_snapshot_table() -> None:
+    """Create report transaction snapshot table for upgraded deployments."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+        if "mysterious_report_transaction_snapshot" not in tables:
+            ddl = f"""
+            CREATE TABLE mysterious_report_transaction_snapshot (
+                id {id_type},
+                report_id bigint NOT NULL DEFAULT 0,
+                transaction_name varchar(255) NOT NULL DEFAULT '',
+                samples int NOT NULL DEFAULT 0,
+                success_count int NOT NULL DEFAULT 0,
+                fail_count int NOT NULL DEFAULT 0,
+                success_rate double NOT NULL DEFAULT 0,
+                tps double NOT NULL DEFAULT 0,
+                avg_rt double NOT NULL DEFAULT 0,
+                max_rt double NOT NULL DEFAULT 0,
+                min_rt double NOT NULL DEFAULT 0,
+                ratio double NOT NULL DEFAULT 0,
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """
+            await conn.execute(text(ddl))
+            log.info("已创建 mysterious_report_transaction_snapshot 表")
+
+        indexes = await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).get_indexes("mysterious_report_transaction_snapshot")
+        )
+        if any(idx.get("name") == "uk_report_transaction_report_name" for idx in indexes):
+            return
+
+        await conn.execute(text("""
+            DELETE FROM mysterious_report_transaction_snapshot
+            WHERE id NOT IN (
+                SELECT keep_id FROM (
+                    SELECT MIN(id) AS keep_id
+                    FROM mysterious_report_transaction_snapshot
+                    GROUP BY report_id, transaction_name
+                ) AS keep_rows
+            )
+        """))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX uk_report_transaction_report_name "
+            "ON mysterious_report_transaction_snapshot (report_id, transaction_name)"
+        ))
+        log.info("已创建 mysterious_report_transaction_snapshot 唯一索引")
+
+
+async def ensure_report_transaction_metric_snapshot_table() -> None:
+    """Create report transaction metric snapshot table for upgraded deployments."""
+    async with async_engine.begin() as conn:
+        dialect = conn.dialect.name
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+        if "mysterious_report_transaction_metric_snapshot" not in tables:
+            ddl = f"""
+            CREATE TABLE mysterious_report_transaction_metric_snapshot (
+                id {id_type},
+                report_id bigint NOT NULL DEFAULT 0,
+                transaction_name varchar(255) NOT NULL DEFAULT '',
+                window_sec int NOT NULL DEFAULT 60,
+                bucket_start_ms bigint NOT NULL DEFAULT 0,
+                timestamp varchar(32) NOT NULL DEFAULT '',
+                qps double NOT NULL DEFAULT 0,
+                avg_rt double NOT NULL DEFAULT 0,
+                p95_rt double NOT NULL DEFAULT 0,
+                p99_rt double NOT NULL DEFAULT 0,
+                error_rate double NOT NULL DEFAULT 0,
+                sample_count int NOT NULL DEFAULT 0,
+                fail_count int NOT NULL DEFAULT 0,
+                active_threads int NOT NULL DEFAULT 0,
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """
+            await conn.execute(text(ddl))
+            log.info("已创建 mysterious_report_transaction_metric_snapshot 表")
+
+        columns = await conn.run_sync(
+            lambda sync_conn: {
+                col["name"] for col in inspect(sync_conn).get_columns("mysterious_report_transaction_metric_snapshot")
+            }
+        )
+        if "active_threads" not in columns:
+            ddl = (
+                "int NOT NULL DEFAULT 0 COMMENT '交易活跃线程数'"
+                if dialect == "mysql"
+                else "INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.execute(text(
+                f"ALTER TABLE mysterious_report_transaction_metric_snapshot ADD COLUMN active_threads {ddl}"
+            ))
+            log.info("已补齐 mysterious_report_transaction_metric_snapshot.active_threads 字段")
+
+        indexes = await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).get_indexes("mysterious_report_transaction_metric_snapshot")
+        )
+        if any(idx.get("name") == "uk_report_transaction_metric_bucket" for idx in indexes):
+            return
+
+        await conn.execute(text("""
+            DELETE FROM mysterious_report_transaction_metric_snapshot
+            WHERE id NOT IN (
+                SELECT keep_id FROM (
+                    SELECT MIN(id) AS keep_id
+                    FROM mysterious_report_transaction_metric_snapshot
+                    GROUP BY report_id, transaction_name, window_sec, bucket_start_ms
+                ) AS keep_rows
+            )
+        """))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX uk_report_transaction_metric_bucket "
+            "ON mysterious_report_transaction_metric_snapshot "
+            "(report_id, transaction_name, window_sec, bucket_start_ms)"
+        ))
+        log.info("已创建 mysterious_report_transaction_metric_snapshot 唯一索引")

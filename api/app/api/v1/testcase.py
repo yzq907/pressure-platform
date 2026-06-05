@@ -23,6 +23,7 @@ from app.schemas.testcase import (
     TestCaseQuery,
     TestCaseStatsVO,
     TestCaseVO,
+    TransactionRunVO,
     ThreadGroupRunVO,
 )
 from app.services import testcase as service
@@ -187,6 +188,21 @@ async def run_thread_groups(
 ) -> Response[list[ThreadGroupRunVO]]:
     items = await service.list_run_thread_groups(db, id)
     return success([ThreadGroupRunVO.model_validate(item) for item in items])
+
+
+@router.get(
+    "/runTransactions/{id}",
+    summary="查询用例 JMX 中可配置占比的交易",
+    response_model=Response[list[TransactionRunVO]],
+    response_model_by_alias=True,
+)
+async def run_transactions(
+    id: int,
+    current: UserContext = Depends(require_permission(PERMISSION_TESTCASE)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[list[TransactionRunVO]]:
+    items = await service.list_run_transactions(db, id)
+    return success([TransactionRunVO.model_validate(item) for item in items])
 
 
 @router.get(

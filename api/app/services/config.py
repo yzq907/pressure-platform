@@ -7,7 +7,13 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import stamp_create, stamp_modify
-from app.core.config_catalog import CATEGORIES, get_category_name, get_category_sort, get_config_meta
+from app.core.config_catalog import (
+    CATEGORIES,
+    DEFAULT_CONFIG_VALUES,
+    get_category_name,
+    get_category_sort,
+    get_config_meta,
+)
 from app.core.codes import Codes
 from app.core.context import UserContext
 from app.core.exceptions import MysteriousException
@@ -108,6 +114,28 @@ async def get_config_list(db: AsyncSession, query: ConfigQuery) -> PageVO[Config
 
 async def get_categories() -> list[ConfigCategoryVO]:
     return [ConfigCategoryVO(key=item.key, name=item.name, sort=item.sort) for item in CATEGORIES]
+
+
+async def ensure_default_configs(db: AsyncSession) -> int:
+    """补齐新增的内置配置项，不覆盖用户已有配置。"""
+    created = 0
+    for key, default_value in DEFAULT_CONFIG_VALUES.items():
+        existing = await crud.get_by_key(db, key)
+        if existing is not None:
+            continue
+        meta = get_config_meta(key)
+        db.add(
+            Config(
+                config_key=key,
+                config_value=default_value,
+                description=meta.display_name,
+            )
+        )
+        created += 1
+    if created:
+        await db.commit()
+        log.info("补齐默认配置项 %d 个", created)
+    return created
 
 
 async def get_value(db: AsyncSession, key: str) -> str:

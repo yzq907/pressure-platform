@@ -20,7 +20,20 @@ from app.core.response import PageVO, Response, success
 from app.db.session import get_db
 from app.deps.auth import get_current_user_dep
 from app.deps.permission import require_any_permission, require_permission
-from app.schemas.report import ArtifactVO, CompareVO, MetricsVO, ReportByTestCaseQuery, ReportQuery, ReportStatsVO, ReportVO
+from app.schemas.report import (
+    ArtifactVO,
+    CompareVO,
+    MetricsVO,
+    ReportByTestCaseQuery,
+    ReportQuery,
+    ReportStatsVO,
+    ReportVO,
+    ResourceMetricsVO,
+    ResourceTargetVO,
+    TransactionMetricsVO,
+    TransactionStatsVO,
+    TransactionTrendVO,
+)
 from app.schemas.testcase import JMeterResultVO
 from app.services import report as service
 
@@ -157,6 +170,38 @@ async def grafana_url(
 
 
 @router.get(
+    "/resourceTargets/{id}",
+    summary="查看指定报告可选的 Prometheus 资源目标",
+    response_model=Response[list[ResourceTargetVO]],
+    response_model_by_alias=True,
+)
+async def get_resource_targets(
+    id: int,
+    current: UserContext = Depends(require_permission(PERMISSION_REPORT)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[list[ResourceTargetVO]]:
+    items = await service.get_resource_targets(db, id)
+    return success(items)
+
+
+@router.get(
+    "/resourceMetrics/{id}",
+    summary="查看指定报告的 Prometheus 资源指标",
+    response_model=Response[ResourceMetricsVO],
+    response_model_by_alias=True,
+)
+async def get_resource_metrics(
+    id: int,
+    step: int | None = None,
+    instance: str | None = None,
+    current: UserContext = Depends(require_permission(PERMISSION_REPORT)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[ResourceMetricsVO]:
+    items = await service.get_resource_metrics(db, id, step, instance)
+    return success(items)
+
+
+@router.get(
     "/artifacts/{id}",
     summary="查看报告产物文件列表",
     response_model=Response[list[ArtifactVO]],
@@ -220,6 +265,53 @@ async def get_metrics(
     db: AsyncSession = Depends(get_db),
 ) -> Response[list[MetricsVO]]:
     items = await service.get_jtl_metrics(db, id, window)
+    return success(items)
+
+
+@router.get(
+    "/transactionStats/{id}",
+    summary="查看指定报告的事务维度统计",
+    response_model=Response[list[TransactionStatsVO]],
+    response_model_by_alias=True,
+)
+async def get_transaction_stats(
+    id: int,
+    current: UserContext = Depends(require_any_permission(PERMISSION_REPORT, PERMISSION_EXECUTION)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[list[TransactionStatsVO]]:
+    items = await service.get_transaction_stats(db, id)
+    return success(items)
+
+
+@router.get(
+    "/transactionMetrics/{id}",
+    summary="查看指定报告的事务维度曲线",
+    response_model=Response[TransactionMetricsVO],
+    response_model_by_alias=True,
+)
+async def get_transaction_metrics(
+    id: int,
+    window: int = 60,
+    current: UserContext = Depends(require_any_permission(PERMISSION_REPORT, PERMISSION_EXECUTION)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[TransactionMetricsVO]:
+    items = await service.get_transaction_metrics(db, id, window)
+    return success(items)
+
+
+@router.get(
+    "/transactionTrend/{id}",
+    summary="查看指定报告的交易性能趋势图",
+    response_model=Response[TransactionTrendVO],
+    response_model_by_alias=True,
+)
+async def get_transaction_trend(
+    id: int,
+    window: int = 60,
+    current: UserContext = Depends(require_any_permission(PERMISSION_REPORT, PERMISSION_EXECUTION)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[TransactionTrendVO]:
+    items = await service.get_transaction_trend(db, id, window)
     return success(items)
 
 

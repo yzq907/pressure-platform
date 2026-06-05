@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import time
@@ -26,6 +27,18 @@ from app.models.node import Node
 from app.models.report import Report
 from app.models.testcase import TestCase
 from app.services import jmeter_runner
+
+
+def _jmeter_property_value(parent, name: str) -> str | None:
+    for prop in parent.iter():
+        if prop.get("name") == name:
+            return prop.text
+        prop_children = list(prop)
+        if prop_children and prop_children[0].tag == "name" and prop_children[0].text == name:
+            for child in prop_children[1:]:
+                if child.tag == "value":
+                    return child.text
+    return None
 
 
 async def _create_case(auth_client: AsyncClient, name: str = "t1") -> int:
@@ -76,6 +89,68 @@ UPLOAD_FILE_JMX = b"""<?xml version="1.0" encoding="UTF-8"?>
   </hashTree>
 </jmeterTestPlan>
 """
+
+TRANSACTION_JMX = """<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan>
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Test Plan" enabled="true"/>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="业务线程组" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">5</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <TransactionController guiclass="TransactionControllerGui" testclass="TransactionController" testname="策略获取" enabled="true">
+          <boolProp name="TransactionController.parent">true</boolProp>
+        </TransactionController>
+        <hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="策略接口" enabled="true"/>
+          <hashTree/>
+        </hashTree>
+        <TransactionController guiclass="TransactionControllerGui" testclass="TransactionController" testname="获取设备信息" enabled="true"/>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
+""".encode()
+
+MULTI_THREAD_GROUP_JMX = """<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan>
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Test Plan" enabled="true"/>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="2_策略获取" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">1</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree><HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="2_策略获取" enabled="true"/><hashTree/></hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="7_获取应用版本" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">1</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree><HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="7_获取应用版本" enabled="true"/><hashTree/></hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="9_下载证书" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">1</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <stringProp name="LoopController.loops">-1</stringProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree><HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="9_下载证书" enabled="true"/><hashTree/></hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
+""".encode()
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +302,7 @@ async def test_run_creates_report_snapshot(
         await db.execute(select(Report).where(Report.test_case_id == case_id))
     ).scalars().one()
     assert report.service_name == "EMM-API"
-    assert report.total_threads == 30
+    assert report.total_threads == 60
     assert report.slave_count == 1
     assert report.region == "华南"
     assert report.grafana_instance == "10.10.27.42:9200"
@@ -272,7 +347,6 @@ async def test_run_applies_thread_group_overrides(
                     "mode": "custom",
                     "numThreads": "1",
                     "rampTime": "1",
-                    "duration": "60",
                 },
                 {"name": "Concurrency Group", "mode": "fixed"},
             ],
@@ -295,9 +369,127 @@ async def test_run_applies_thread_group_overrides(
                     values[(testname, name)] = prop.text or ""
     assert values[("Default ThreadGroup", "ThreadGroup.num_threads")] == "1"
     assert values[("Default ThreadGroup", "ThreadGroup.ramp_time")] == "1"
-    assert values[("Default ThreadGroup", "ThreadGroup.duration")] == "60"
+    assert values[("Default ThreadGroup", "ThreadGroup.duration")] == "600"
     assert values[("Concurrency Group", "TargetLevel")] == "100"
     assert values[("Concurrency Group", "Hold")] == "300"
+
+
+@pytest.mark.asyncio
+async def test_run_transactions_lists_transaction_controllers(
+    auth_client: AsyncClient,
+    data_home: Path,
+) -> None:
+    case_id = await _create_case_with_jmx(auth_client, "r_transactions", TRANSACTION_JMX)
+
+    resp = await auth_client.get(f"/testcase/runTransactions/{case_id}")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"] == [
+        {
+            "key": "transaction:0",
+            "name": "策略获取",
+            "threadGroup": "业务线程组",
+            "enabled": True,
+        },
+        {
+            "key": "transaction:1",
+            "name": "获取设备信息",
+            "threadGroup": "业务线程组",
+            "enabled": True,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_applies_thread_group_pacing_cycle_timer(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+
+    case_id = await _create_case_with_jmx(auth_client, "r_thread_group_pacing", TRANSACTION_JMX)
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={
+            "numThreads": "10",
+            "rampTime": "1",
+            "duration": "60",
+            "slaveCount": 0,
+            "threadGroupOverrides": [
+                {"key": "thread_group:0", "name": "业务线程组", "enabled": True, "mode": "global", "pacingMs": 800}
+            ],
+        },
+    )
+
+    assert resp.json()["code"] == 0
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+    from lxml import etree
+
+    run_jmx = Path(captured["cmd"][captured["cmd"].index("-t") + 1])
+    tree = etree.parse(str(run_jmx))
+    timer = next(tree.iter("JSR223Timer"))
+    assert timer.get("testname") == "平台Pacing_业务线程组"
+    assert _jmeter_property_value(timer, "parameters") == "800"
+    assert _jmeter_property_value(timer, "scriptLanguage") == "groovy"
+    assert "platform_pacing_next_start" in (_jmeter_property_value(timer, "script") or "")
+    assert list(tree.iter("ConstantTimer")) == []
+
+
+@pytest.mark.asyncio
+async def test_run_meta_total_threads_uses_sum_of_custom_thread_groups(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+
+    case_id = await _create_case_with_jmx(auth_client, "r_thread_group_total", MULTI_THREAD_GROUP_JMX)
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={
+            "numThreads": "10",
+            "rampTime": "1",
+            "duration": "60",
+            "slaveCount": 0,
+            "threadGroupOverrides": [
+                {"key": "thread_group:0", "name": "2_策略获取", "enabled": True, "mode": "custom", "numThreads": "7", "rampTime": "1"},
+                {"key": "thread_group:1", "name": "7_获取应用版本", "enabled": True, "mode": "custom", "numThreads": "7", "rampTime": "1"},
+                {"key": "thread_group:2", "name": "9_下载证书", "enabled": True, "mode": "custom", "numThreads": "1", "rampTime": "1"},
+            ],
+        },
+    )
+
+    assert resp.json()["code"] == 0
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+    report = (await db.execute(select(Report).where(Report.test_case_id == case_id))).scalars().one()
+    assert report.total_threads == 15
+
+    assert captured["cmd"]
+    report_root = Path(report.report_dir).resolve().parent
+    meta = json.loads((report_root / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["total_threads"] == 15
+    assert meta["per_slave_threads"] == 15
 
 
 @pytest.mark.asyncio

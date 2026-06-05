@@ -61,8 +61,11 @@ from app.services import execution_node as execution_node_service
 from app.services import jmeter_runner
 from app.services import report as report_service
 from app.core.jmeter_xml import (
+    apply_thread_group_pacing,
     csv_ignore_first_line,
     list_thread_groups,
+    list_transactions,
+    sum_enabled_thread_group_threads,
     update_csv_filenames,
     update_run_thread,
     update_upload_file_paths,
@@ -528,6 +531,19 @@ def _validate_thread_group_overrides(jmx_path: str, overrides: list[dict]) -> No
             )
 
 
+def _validate_thread_group_pacing(overrides: list[dict]) -> None:
+    for override in overrides:
+        try:
+            pacing_ms = int(override.get("pacing_ms") or 0)
+        except (TypeError, ValueError):
+            pacing_ms = -1
+        if pacing_ms < 0:
+            raise MysteriousException(
+                Codes.FAIL,
+                message=f"Pacing 必须大于等于 0: {override.get('name') or override.get('key') or ''}",
+            )
+
+
 async def _sync_dependency_files_to_slave(slave, files: list[tuple[str, str, str, str]]) -> None:
     """把文件并发同步到单台 slave，收集失败后一次性返回。"""
     if not files:
@@ -801,6 +817,7 @@ async def _run_testcase_now(
     run_jmx_path = jmx.jmx_dir + run_jmx_name
     thread_group_overrides = _prepare_thread_group_overrides(param, slave_count)
     _validate_thread_group_overrides(src_jmx_path, thread_group_overrides)
+    _validate_thread_group_pacing(thread_group_overrides)
     update_run_thread(
         src_jmx_path,
         run_jmx_path,
@@ -814,6 +831,12 @@ async def _run_testcase_now(
         run_jmx_path,
         {item.src_name: item.file_dir + item.dst_name for item in upload_files},
     )
+    actual_slave_count = max(1, slave_count)
+    apply_thread_group_pacing(run_jmx_path, run_jmx_path, thread_group_overrides)
+    actual_per_slave_threads = sum_enabled_thread_group_threads(run_jmx_path)
+    if actual_per_slave_threads > 0:
+        per_slave_threads = actual_per_slave_threads
+        total_threads = actual_per_slave_threads * actual_slave_count
 
     # 清理旧 run_*.jmx，只保留最近 5 个
     _cleanup_old_run_jmx(jmx.jmx_dir, id, keep=5)
@@ -827,7 +850,6 @@ async def _run_testcase_now(
     if healthy_slaves:
         csvs = await csv_crud.get_by_test_case_id(db, id)
         await _prepare_split_csv_files(csvs, healthy_slaves, str(Path(data_dir).resolve().parent), run_jmx_path)
-    actual_slave_count = max(1, slave_count)
     remote_hosts = [
         s.host if legacy_ignore_health else f"{s.host}:1099"
         for s in healthy_slaves
@@ -1008,6 +1030,19 @@ async def list_run_thread_groups(db: AsyncSession, id: int) -> list[dict[str, st
     if not Path(jmx_path).exists():
         raise MysteriousException(Codes.FILE_NOT_EXIST)
     return list_thread_groups(jmx_path)
+
+
+async def list_run_transactions(db: AsyncSession, id: int) -> list[dict[str, str]]:
+    testcase = await crud.get_by_id(db, id)
+    if testcase is None:
+        raise MysteriousException(Codes.TESTCASE_NOT_EXIST)
+    jmx = await jmx_crud.get_by_test_case_id(db, id)
+    if jmx is None:
+        raise MysteriousException(Codes.JMX_NOT_EXIST)
+    jmx_path = jmx.jmx_dir + jmx.dst_name
+    if not Path(jmx_path).exists():
+        raise MysteriousException(Codes.FILE_NOT_EXIST)
+    return list_transactions(jmx_path)
 
 
 async def stop_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:

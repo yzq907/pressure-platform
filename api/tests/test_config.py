@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.config import Config
+from app.services.config import ensure_default_configs
 
 
 @pytest.mark.asyncio
@@ -138,6 +139,51 @@ async def test_list_config_by_category_adds_metadata(auth_client: AsyncClient) -
     assert other_page["total"] == 1
     assert other_page["list"][0]["configKey"] == "CUSTOM_UNKNOWN"
     assert other_page["list"][0]["category"] == "other"
+
+
+@pytest.mark.asyncio
+async def test_ensure_default_configs_adds_prometheus_step_to_config_list(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    await ensure_default_configs(db)
+
+    resp = await auth_client.get("/config/list?page=1&size=50&category=prometheus")
+    page = resp.json()["data"]
+    item = next(
+        config for config in page["list"] if config["configKey"] == "PROMETHEUS_STEP_SECONDS"
+    )
+
+    assert item["configValue"] == "30"
+    assert item["description"] == "Prometheus默认查询步长秒"
+    assert item["category"] == "prometheus"
+    assert item["displayName"] == "Prometheus默认查询步长秒"
+    assert item["valueType"] == "number"
+
+
+@pytest.mark.asyncio
+async def test_ensure_default_configs_does_not_overwrite_existing_value(
+    db: AsyncSession,
+) -> None:
+    db.add(
+        Config(
+            config_key="PROMETHEUS_STEP_SECONDS",
+            config_value="45",
+            description="自定义步长",
+        )
+    )
+    await db.commit()
+
+    await ensure_default_configs(db)
+
+    rows = (
+        await db.execute(
+            select(Config).where(Config.config_key == "PROMETHEUS_STEP_SECONDS")
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].config_value == "45"
+    assert rows[0].description == "自定义步长"
 
 
 @pytest.mark.asyncio

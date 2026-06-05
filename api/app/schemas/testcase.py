@@ -98,7 +98,7 @@ class ThreadGroupRunOverride(CamelModel):
     mode: str = "global"
     num_threads: str | None = None
     ramp_time: str | None = None
-    duration: str | None = None
+    pacing_ms: int | None = None
 
 
 class ThreadGroupRunVO(CamelModel):
@@ -107,6 +107,15 @@ class ThreadGroupRunVO(CamelModel):
     key: str = ""
     name: str = ""
     type: str = ""
+    enabled: bool = True
+
+
+class TransactionRunVO(CamelModel):
+    """JMX 中可配置占比的 TransactionController。"""
+
+    key: str = ""
+    name: str = ""
+    thread_group: str = ""
     enabled: bool = True
 
 

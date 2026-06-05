@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,10 @@ async def test_launch_jmeter_persists_execution_run_lifecycle(
     db.add(rpt)
     await db.commit()
     await db.refresh(rpt)
+    old_report_time = datetime(2026, 1, 1, 10, 0, 0)
+    rpt.create_time = old_report_time
+    rpt.modify_time = old_report_time
+    await db.commit()
     testcase_id = tc.id
     report_id = rpt.id
 
@@ -80,6 +85,8 @@ async def test_launch_jmeter_persists_execution_run_lifecycle(
     assert running.status == "success"
     assert running.exit_code == 0
     assert running.finished_at is not None
+    await db.refresh(rpt)
+    assert rpt.modify_time > old_report_time
 
 
 @pytest.mark.asyncio
