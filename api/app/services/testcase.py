@@ -1057,6 +1057,12 @@ async def stop_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:
     )
     running_reports = list((await db.execute(stmt)).scalars().all())
 
+    if not running_reports:
+        log.warning("[stop] testcase_id=%s 状态为执行中，但未找到运行中的报告，清理用例状态", id)
+        testcase.status = TestCaseStatus.RUN_FAILED.value
+        await db.commit()
+        return True
+
     for rpt in running_reports:
         ok = await jmeter_runner.launch_stop(rpt.id)
         log.info("[stop] report_id=%s region=%s ok=%s", rpt.id, rpt.region, ok)

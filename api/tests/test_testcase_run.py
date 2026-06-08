@@ -1376,7 +1376,7 @@ async def test_stop_running_transitions_to_success(
     sample_jmx_bytes: bytes,
     db: AsyncSession,
 ) -> None:
-    """stop 时 testcase 必须是 RUN_ING；shutdown.sh callback 应把状态改为 RUN_SUCCESS"""
+    """stop 遇到 RUN_ING 用例但没有运行报告时，应清理脏状态。"""
     case_id = await _create_case_with_jmx(auth_client, "s_run", sample_jmx_bytes)
     # 手动把状态改为 RUN_ING
     tc = (await db.execute(select(TestCase).where(TestCase.id == case_id))).scalar_one()
@@ -1386,15 +1386,8 @@ async def test_stop_running_transitions_to_success(
     resp = await auth_client.get(f"/testcase/stop/{case_id}")
     assert resp.json()["code"] == 0
 
-    # 等 shutdown.sh + callback 跑完。stop 不挂在 _running_tasks，所以直接 sleep 一会。
-    import asyncio as _a
-
-    for _ in range(20):
-        await _a.sleep(0.05)
-        await db.refresh(tc)
-        if tc.status == TestCaseStatus.RUN_SUCCESS.value:
-            break
-    assert tc.status == TestCaseStatus.RUN_SUCCESS.value
+    await db.refresh(tc)
+    assert tc.status == TestCaseStatus.RUN_FAILED.value
 
 
 # ---------------------------------------------------------------------------
@@ -1577,6 +1570,6 @@ async def test_get_jmeter_result_parses_log(
     resp = await auth_client.get(f"/testcase/getJMeterResult/{case_id}")
     items = resp.json()["data"]
     assert len(items) == 1
-    assert items[0]["timestamp"] == "10:00:00"
+    assert items[0]["currentTime"] == "10:00:00"
     assert items[0]["throughput"] == 100.0
     assert items[0]["avgResponseTime"] == 5.0

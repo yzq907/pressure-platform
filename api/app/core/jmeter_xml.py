@@ -420,6 +420,9 @@ def apply_thread_group_pacing(
     """按线程组配置插入 JSR223 周期 Timer。pacing_ms <= 0 时不插入。
 
     update_run_thread 已负责线程组启停、并发、运行时长。这里只处理 Pacing。
+    Timer 插入在线程组 hashTree 开头，作用域是整个线程组；JMeter 会在该
+    线程组内每个 Sampler 执行前调用 Timer。复杂脚本如果需要“每轮循环一次”
+    的 pacing，需要在脚本结构上单独隔离控制器或线程组。
     """
     tree = _parse(jmx_path)
     root_hash = tree.getroot().find("hashTree")

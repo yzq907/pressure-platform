@@ -23,6 +23,8 @@ from app.models.report_metric_snapshot import ReportMetricSnapshot
 from app.models.report_transaction_metric_snapshot import ReportTransactionMetricSnapshot
 from app.models.testcase import TestCase
 from app.services import report as report_service
+from app.services import report_metrics as report_metrics_service
+from app.services import prometheus as prometheus_service
 from app.services.report import _parse_jtl_metrics
 
 
@@ -202,7 +204,7 @@ async def test_report_resource_metrics_queries_prometheus(
         })
         return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
 
-    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
 
     resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
     body = resp.json()
@@ -239,7 +241,7 @@ async def test_report_resource_metrics_uses_configured_step_when_request_omits_s
         captured.append(step)
         return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
 
-    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
 
     resp = await auth_client.get(f"/report/resourceMetrics/{rid}")
     body = resp.json()
@@ -275,7 +277,7 @@ async def test_report_resource_metrics_queries_prometheus_metrics_concurrently(
         active -= 1
         return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
 
-    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
 
     resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
     body = resp.json()
@@ -398,7 +400,7 @@ async def test_report_resource_metrics_uses_requested_instance(
         captured.append({"query": query, "step": step})
         return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 1.0}]
 
-    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
 
     resp = await auth_client.get(
         f"/report/resourceMetrics/{rid}",
@@ -440,7 +442,7 @@ async def test_report_resource_metrics_prefers_prometheus_map_over_grafana_snaps
         captured.append(query)
         return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 1.0}]
 
-    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
 
     resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
     body = resp.json()
@@ -486,7 +488,7 @@ async def test_report_resource_metrics_uses_execution_run_time_range(
         captured.append({"start": start, "end": end})
         return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 1.0}]
 
-    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
 
     resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
     data = resp.json()["data"]
@@ -535,9 +537,9 @@ async def test_report_resource_metrics_caps_prometheus_query_end_to_stable_now(
         captured.append({"start": start, "end": end, "step": step})
         return [{"timestamp": "15:54:00", "timestamp_ms": 1780559640000, "value": 1.0}]
 
-    monkeypatch.setattr(report_service, "_query_prometheus_range", fake_query)
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
     monkeypatch.setattr(
-        report_service.time,
+        prometheus_service.time,
         "time",
         lambda: report_service._to_epoch_ms(datetime(2026, 6, 4, 15, 55, 0)) / 1000,
     )
@@ -1334,7 +1336,7 @@ async def test_get_jtl_metrics_persists_snapshot_and_reuses_it(
     def fail_find_jtl(report_dir: str):
         raise AssertionError("should read metrics snapshot instead of parsing JTL again")
 
-    monkeypatch.setattr(report_service, "_find_jtl_file", fail_find_jtl)
+    monkeypatch.setattr(report_metrics_service, "_find_jtl_file", fail_find_jtl)
     second = await report_service.get_jtl_metrics(db, rid, 5)
 
     assert second == first
@@ -1372,8 +1374,8 @@ async def test_get_jtl_metrics_refreshes_running_report_snapshot(
         scheduled.append((report_id, tuple(windows)))
         return True
 
-    monkeypatch.setattr(report_service, "schedule_metric_snapshot_generation", fake_schedule)
-    monkeypatch.setattr(report_service, "_metric_snapshot_last_refresh", {}, raising=False)
+    monkeypatch.setattr(report_metrics_service, "schedule_metric_snapshot_generation", fake_schedule)
+    monkeypatch.setattr(report_metrics_service, "_metric_snapshot_last_refresh", {}, raising=False)
 
     items = await report_service.get_jtl_metrics(db, rid, 5)
 
@@ -1413,8 +1415,8 @@ async def test_get_jtl_metrics_does_not_refresh_finished_snapshot(
         scheduled.append((report_id, tuple(windows)))
         return True
 
-    monkeypatch.setattr(report_service, "schedule_metric_snapshot_generation", fake_schedule)
-    monkeypatch.setattr(report_service, "_metric_snapshot_last_refresh", {}, raising=False)
+    monkeypatch.setattr(report_metrics_service, "schedule_metric_snapshot_generation", fake_schedule)
+    monkeypatch.setattr(report_metrics_service, "_metric_snapshot_last_refresh", {}, raising=False)
 
     items = await report_service.get_jtl_metrics(db, rid, 5)
 
@@ -1496,8 +1498,8 @@ async def test_get_jtl_metrics_does_not_parse_jtl_on_request_when_snapshot_missi
         scheduled.append((report_id, tuple(windows)))
         return True
 
-    monkeypatch.setattr(report_service, "_parse_jtl_metrics", fail_parse)
-    monkeypatch.setattr(report_service, "schedule_metric_snapshot_generation", fake_schedule)
+    monkeypatch.setattr(report_metrics_service, "_parse_jtl_metrics", fail_parse)
+    monkeypatch.setattr(report_metrics_service, "schedule_metric_snapshot_generation", fake_schedule)
 
     items = await report_service.get_jtl_metrics(db, rid, 5)
 
@@ -1527,13 +1529,13 @@ async def test_generate_metric_snapshot_parses_jtl_in_worker_thread(
     )
     rid = await _insert_report(db, name="snapshot_thread", report_dir=str(data_dir) + os.sep)
     calls: list[str] = []
-    real_to_thread = report_service.asyncio.to_thread
+    real_to_thread = report_metrics_service.asyncio.to_thread
 
     async def tracking_to_thread(func, /, *args, **kwargs):
         calls.append(func.__name__)
         return await real_to_thread(func, *args, **kwargs)
 
-    monkeypatch.setattr(report_service.asyncio, "to_thread", tracking_to_thread)
+    monkeypatch.setattr(report_metrics_service.asyncio, "to_thread", tracking_to_thread)
 
     count = await report_service.generate_metric_snapshots_for_report(db, rid)
 
