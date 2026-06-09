@@ -12,12 +12,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import NodeStatus, NodeType
+from app.core.context import UserContext
 from app.models.execution_node import ExecutionNode
 from app.models.node import Node
 from app.models.scheduled_task import ScheduledTask
 from app.models.scheduled_task_log import ScheduledTaskLog
 from app.models.testcase import TestCase
-from app.services.scheduled_task import _execute_scheduled
+from app.schemas.scheduled_task import ScheduledTaskParam
+from app.services.scheduled_task import _execute_scheduled, add_scheduled_task
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -52,6 +54,77 @@ async def _create_task(
     await db.commit()
     await db.refresh(task)
     return task
+
+
+@pytest.mark.asyncio
+async def test_add_scheduled_task_persists_thread_group_overrides(
+    db: AsyncSession,
+) -> None:
+    testcase = TestCase(name="scheduled_thread_group_overrides", status=0, test_case_dir="/tmp")
+    db.add(testcase)
+    await db.commit()
+    await db.refresh(testcase)
+
+    task_id = await add_scheduled_task(
+        db,
+        ScheduledTaskParam.model_validate(
+            {
+                "testCaseId": testcase.id,
+                "scheduleType": "daily",
+                "scheduleData": {"time": "20:00"},
+                "runParam": {
+                    "numThreads": "30",
+                    "rampTime": "5",
+                    "duration": "60",
+                    "slaveCount": 1,
+                    "region": "华南",
+                    "threadGroupOverrides": [
+                        {
+                            "key": "tg-1",
+                            "name": "登录线程组",
+                            "enabled": True,
+                            "mode": "custom",
+                            "numThreads": "7",
+                            "rampTime": "3",
+                            "pacingMs": 500,
+                        },
+                        {
+                            "key": "tg-2",
+                            "name": "禁用线程组",
+                            "enabled": False,
+                            "mode": "fixed",
+                            "pacingMs": 0,
+                        },
+                    ],
+                },
+            }
+        ),
+        UserContext(id=1, username="tester", real_name="tester"),
+    )
+    task = await db.get(ScheduledTask, task_id)
+
+    assert task is not None
+    run_param = json.loads(task.run_param)
+    assert run_param["threadGroupOverrides"] == [
+        {
+            "key": "tg-1",
+            "name": "登录线程组",
+            "enabled": True,
+            "mode": "custom",
+            "numThreads": "7",
+            "rampTime": "3",
+            "pacingMs": 500,
+        },
+        {
+            "key": "tg-2",
+            "name": "禁用线程组",
+            "enabled": False,
+            "mode": "fixed",
+            "numThreads": None,
+            "rampTime": None,
+            "pacingMs": 0,
+        },
+    ]
 
 
 @pytest.mark.asyncio
