@@ -154,7 +154,7 @@ async def test_disable_with_running_process(
     call_count = {"ps": 0}
 
     async def custom_exec(self, command: str) -> str:
-        if "ps aux" in command and "grep jmeter-server" in command and "kill" not in command:
+        if "ApacheJMeter.jar" in command and "grep" in command and "kill" not in command:
             call_count["ps"] += 1
             # 第一次 ps：有进程；第二次 ps（kill 之后）：没进程
             return "root  12345  ..." if call_count["ps"] == 1 else "null"
@@ -165,7 +165,12 @@ async def test_disable_with_running_process(
     monkeypatch.setattr(ssh_mod.SSHClient, "exec_command", custom_exec)
 
     nid = await _create_node(db, status=NodeStatus.ENABLE.value)
+    n = (await db.execute(select(Node).where(Node.id == nid))).scalar_one()
+    n.health_status = 1
+    await db.commit()
+
     resp = await auth_client.get(f"/node/disable/{nid}")
     assert resp.json()["code"] == 0
-    n = (await db.execute(select(Node).where(Node.id == nid))).scalar_one()
+    await db.refresh(n)
     assert n.status == NodeStatus.DISABLED.value
+    assert n.health_status == 0

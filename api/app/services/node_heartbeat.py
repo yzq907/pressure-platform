@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.ssh import SSHClient
 from app.db.session import AsyncSessionLocal
 from app.models.node import Node
+from app.services import config as config_service
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 log = logging.getLogger(__name__)
@@ -21,13 +23,53 @@ _heartbeat_task: asyncio.Task | None = None
 
 # 并发控制信号量，最多同时 5 个 SSH 连接
 _SEMAPHORE = asyncio.Semaphore(5)
+_JMETER_SERVER_PS_CMD = "ps -ef | grep 'ApacheJMeter.jar' | grep ' -s ' | grep -v grep"
+_JMETER_SERVER_START_WAIT_SECONDS = 2
 
 
 def _now() -> datetime:
     return datetime.now(SHANGHAI)
 
 
-async def _check_single_node(db: AsyncSession, node: Node) -> None:
+def _jmeter_server_running(output: str | None) -> bool:
+    return bool(output and output != "null")
+
+
+def _jmeter_server_started(output: str | None, host: str) -> bool:
+    return bool(output and (host in output or "Using local port" in output))
+
+
+async def _ensure_jmeter_server_running(
+    ssh: SSHClient,
+    node: Node,
+    *,
+    slave_bin: str,
+    slave_log: str,
+) -> bool:
+    ps_output = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
+    if _jmeter_server_running(ps_output):
+        return True
+    if not slave_bin or not slave_log:
+        log.warning("Node %s(%s) jmeter-server missing and slave paths are not configured", node.name, node.host)
+        return False
+
+    slave_bin = slave_bin.rstrip("/")
+    slave_log = slave_log.rstrip("/")
+    start_cmd = (
+        f"mkdir -p {shlex.quote(slave_log)} && cd {shlex.quote(slave_log)} && "
+        f"nohup {shlex.quote(f'{slave_bin}/jmeter-server')} "
+        f"-Djava.rmi.server.hostname={shlex.quote(node.host)} "
+        f"> jmeter-server.log 2>&1 & echo $!"
+    )
+    result = await ssh.exec_command(start_cmd)
+    log.info("Heartbeat restarted jmeter-server host=%s output=%s", node.host, result)
+    if _JMETER_SERVER_START_WAIT_SECONDS > 0:
+        await asyncio.sleep(_JMETER_SERVER_START_WAIT_SECONDS)
+    ps_after_start = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
+    return _jmeter_server_running(ps_after_start) or _jmeter_server_started(result, node.host)
+
+
+async def _check_single_node(db: AsyncSession, node: Node, *, slave_bin: str, slave_log: str) -> None:
     """检查单个节点健康状态并更新 DB。"""
     async with _SEMAPHORE:
         ssh = SSHClient(
@@ -56,12 +98,28 @@ async def _check_single_node(db: AsyncSession, node: Node) -> None:
             except (ValueError, TypeError):
                 cpu_usage = 0.0
 
-            node.health_status = 1
+            # 5. 对压力机来说，SSH 可连但 jmeter-server 进程不存在时主动拉起；拉起失败才判为不健康。
+            node.health_status = 1 if await _ensure_jmeter_server_running(
+                ssh,
+                node,
+                slave_bin=slave_bin,
+                slave_log=slave_log,
+            ) else 0
             node.last_heartbeat = _now()
             node.load_avg = load_avg
             node.mem_usage = mem_usage
             node.cpu_usage = cpu_usage
-            log.debug("Node %s(%s) healthy: cpu=%s mem=%s load=%s", node.name, node.host, cpu_usage, mem_usage, load_avg)
+            if node.health_status == 1:
+                log.debug(
+                    "Node %s(%s) healthy: cpu=%s mem=%s load=%s",
+                    node.name,
+                    node.host,
+                    cpu_usage,
+                    mem_usage,
+                    load_avg,
+                )
+            else:
+                log.info("Node %s(%s) jmeter-server missing", node.name, node.host)
         except Exception as e:
             node.health_status = 0
             node.last_heartbeat = _now()
@@ -84,8 +142,10 @@ async def _heartbeat_round(db: AsyncSession) -> None:
     if not nodes:
         return
 
+    slave_bin = await config_service.get_value_or_default(db, "SLAVE_JMETER_BIN_HOME", "")
+    slave_log = await config_service.get_value_or_default(db, "SLAVE_JMETER_LOG_HOME", "")
     log.info("Heartbeat round started: %d nodes", len(nodes))
-    tasks = [_check_single_node(db, node) for node in nodes]
+    tasks = [_check_single_node(db, node, slave_bin=slave_bin, slave_log=slave_log) for node in nodes]
     await asyncio.gather(*tasks, return_exceptions=True)
     log.info("Heartbeat round finished")
 

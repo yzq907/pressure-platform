@@ -22,6 +22,11 @@ from app.services import config as config_service
 log = logging.getLogger(__name__)
 
 _MD5_RE = re.compile(r"^[a-fA-F0-9]{32}$")
+_JMETER_SERVER_PS_CMD = "ps -ef | grep 'ApacheJMeter.jar' | grep ' -s ' | grep -v grep"
+_JMETER_SERVER_KILL_CMD = (
+    "ps -ef | awk '/ApacheJMeter.jar/ && / -s / {print $2}' | xargs -r kill -9; "
+    "ps -ef | awk '/jmeter-server/ && !/awk/ {print $2}' | xargs -r kill -9"
+)
 
 
 def _check_param(param: NodeParam) -> None:
@@ -182,21 +187,22 @@ async def enable_node(db: AsyncSession, id: int, user: UserContext) -> bool:
             raise MysteriousException(Codes.JMETER_SERVER_NOT_FOUND)
 
         # ps 检查（应为 null）
-        ps_before = await ssh.exec_command("ps aux | grep jmeter-server | grep -v grep")
+        ps_before = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
         if ps_before != "null":
             raise MysteriousException(Codes.JMETER_SERVER_IS_ENABLE)
 
         # 启动
         start_cmd = (
-            f"cd {slave_log}\n{jmeter_server} -Djava.rmi.server.hostname={obj.host}"
+            f"mkdir -p {slave_log} && cd {slave_log} && nohup {jmeter_server} "
+            f"-Djava.rmi.server.hostname={obj.host} > jmeter-server.log 2>&1 & echo $!"
         )
         result = await ssh.exec_command(start_cmd)
         log.info("启动命令行输出 host=%s: %s", obj.host, result)
-        if obj.host not in result and "Using local port" not in result:
+        if result == "null":
             raise MysteriousException(Codes.JMETER_SERVER_ENABLE_ERROR)
 
         # 启动后再次 ps
-        ps_after = await ssh.exec_command("ps aux | grep jmeter-server | grep -v grep")
+        ps_after = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
         if ps_after == "null":
             raise MysteriousException(Codes.JMETER_SERVER_IS_NOT_ENABLE)
     except MysteriousException:
@@ -223,19 +229,16 @@ async def disable_node(db: AsyncSession, id: int, user: UserContext) -> bool:
         raise MysteriousException(Codes.ONLY_SLAVE_CAN_DISABLE)
 
     obj.status = NodeStatus.DISABLED.value
+    obj.health_status = 0
     stamp_modify(obj, user)
     await crud.update(db, obj)
 
     ssh = SSHClient(obj.host, obj.port, obj.username, obj.password)
-    if (await ssh.exec_command("ps aux | grep jmeter-server | grep -v grep")) == "null":
+    if (await ssh.exec_command(_JMETER_SERVER_PS_CMD)) == "null":
         raise MysteriousException(Codes.JMETER_SERVER_IS_NOT_ENABLE)
-    await ssh.exec_command(
-        "ps aux | grep jmeter-server | grep -v grep | awk '{print $2}' | xargs kill -9"
-    )
-    if (await ssh.exec_command("ps aux | grep jmeter-server | grep -v grep")) != "null":
-        await ssh.exec_command(
-            "ps aux | grep jmeter-server | grep -v grep | awk '{print $2}' | xargs kill -9"
-        )
+    await ssh.exec_command(_JMETER_SERVER_KILL_CMD)
+    if (await ssh.exec_command(_JMETER_SERVER_PS_CMD)) != "null":
+        await ssh.exec_command(_JMETER_SERVER_KILL_CMD)
     return True
 
 

@@ -80,6 +80,7 @@ class TestCaseFullVO(TestCaseVO):
 class RunParam(CamelModel):
     """执行用例时的压测参数"""
 
+    task_name: str = ""
     num_threads: str = "10"
     ramp_time: str = "0"
     duration: str = "60"

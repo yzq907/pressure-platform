@@ -16,8 +16,10 @@ from app.core.response import PageVO
 from app.core.security import check_password_strength, generate_token, hash_password, token_expire_time, verify_password
 from app.crud import role as role_crud
 from app.crud import user as user_crud
+from app.crud import user_session as user_session_crud
 from app.models.role import Role
 from app.models.user import User
+from app.models.user_session import UserSession
 from app.schemas.user import CurrentUserVO, UpdatePasswordParam, UserParam, UserQuery, UserVO
 
 log = logging.getLogger(__name__)
@@ -175,9 +177,18 @@ async def login(db: AsyncSession, param: UserParam) -> str:
     if not verify_password(param.password or "", user.password or ""):
         raise MysteriousException(Codes.USER_PASSWORD_ERROR)
 
-    _refresh_token(user)
-    await user_crud.update(db, user)
-    return user.token
+    now_local = datetime.now(SHANGHAI).replace(tzinfo=None)
+    expire = token_expire_time().astimezone(SHANGHAI).replace(tzinfo=None)
+    user.effect_time = now_local
+    user.expire_time = expire
+    session = UserSession(
+        user_id=user.id,
+        token=generate_token(),
+        effect_time=now_local,
+        expire_time=expire,
+    )
+    await user_session_crud.add(db, session)
+    return session.token
 
 
 async def ensure_admin_user(db: AsyncSession) -> None:
@@ -255,6 +266,7 @@ async def update_password(
         raise MysteriousException(Codes.USER_PASSWORD_TOO_WEAK, message=reason)
 
     user.password = hash_password(param.new_password)
+    await user_session_crud.delete_by_user_id(db, user.id)
     _refresh_token(user)
     await user_crud.update(db, user)
     return True

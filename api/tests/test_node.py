@@ -13,6 +13,113 @@ from app.models.node import Node
 
 
 @pytest.mark.asyncio
+async def test_node_heartbeat_restarts_missing_jmeter_server_for_enabled_slave(
+    db: AsyncSession,
+    monkeypatch,
+    slave_paths: None,
+) -> None:
+    """启用压力机 SSH 正常但 jmeter-server 进程不存在时，心跳应主动拉起。"""
+    from app.core import ssh as ssh_mod
+    from app.services import node_heartbeat
+
+    monkeypatch.setattr(node_heartbeat, "_JMETER_SERVER_START_WAIT_SECONDS", 0)
+
+    commands: list[str] = []
+    server_started = False
+
+    async def fake_exec(self, command: str) -> str:
+        nonlocal server_started
+        commands.append(command)
+        if "ApacheJMeter.jar" in command and "grep" in command:
+            return "root 12345 ... jmeter-server" if server_started else "null"
+        if "jmeter-server" in command and "rmi.server.hostname" in command:
+            server_started = True
+            return "Using local port: 1099"
+        if "cat /proc/loadavg" in command:
+            return "0.10"
+        if command.startswith("free "):
+            return "20.0"
+        if command.startswith("top "):
+            return "90.0"
+        return ""
+
+    monkeypatch.setattr(ssh_mod.SSHClient, "exec_command", fake_exec)
+
+    node = Node(
+        name="heartbeat-missing-server",
+        type=NodeType.SLAVE.value,
+        host="10.0.7.1",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+    )
+    db.add(node)
+    await db.commit()
+    await db.refresh(node)
+
+    await node_heartbeat._heartbeat_round(db)
+
+    await db.refresh(node)
+    assert node.status == NodeStatus.ENABLE.value
+    assert node.health_status == 1
+    assert node.last_heartbeat is not None
+    assert any("jmeter-server -Djava.rmi.server.hostname=10.0.7.1" in cmd for cmd in commands)
+
+
+@pytest.mark.asyncio
+async def test_node_heartbeat_keeps_enabled_slave_unhealthy_when_jmeter_restart_fails(
+    db: AsyncSession,
+    monkeypatch,
+    slave_paths: None,
+) -> None:
+    """启用压力机自动拉起 jmeter-server 失败时，心跳仍应标记为不健康。"""
+    from app.core import ssh as ssh_mod
+    from app.services import node_heartbeat
+
+    monkeypatch.setattr(node_heartbeat, "_JMETER_SERVER_START_WAIT_SECONDS", 0)
+
+    commands: list[str] = []
+
+    async def fake_exec(self, command: str) -> str:
+        commands.append(command)
+        if "ApacheJMeter.jar" in command and "grep" in command:
+            return "null"
+        if "cat /proc/loadavg" in command:
+            return "0.10"
+        if command.startswith("free "):
+            return "20.0"
+        if command.startswith("top "):
+            return "90.0"
+        return ""
+
+    monkeypatch.setattr(ssh_mod.SSHClient, "exec_command", fake_exec)
+
+    node = Node(
+        name="heartbeat-restart-failed",
+        type=NodeType.SLAVE.value,
+        host="10.0.7.2",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+    )
+    db.add(node)
+    await db.commit()
+    await db.refresh(node)
+
+    await node_heartbeat._heartbeat_round(db)
+
+    await db.refresh(node)
+    assert node.status == NodeStatus.ENABLE.value
+    assert node.health_status == 0
+    assert node.last_heartbeat is not None
+    assert any("jmeter-server -Djava.rmi.server.hostname=10.0.7.2" in cmd for cmd in commands)
+
+
+@pytest.mark.asyncio
 async def test_node_requires_auth(client: AsyncClient) -> None:
     resp = await client.get("/node/list?page=1&size=10")
     assert resp.json()["code"] == 1007

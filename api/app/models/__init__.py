@@ -29,6 +29,7 @@ from app.models.scheduled_task_log import ScheduledTaskLog
 from app.models.testcase import TestCase
 from app.models.upload_file import UploadFileResource
 from app.models.user import User
+from app.models.user_session import UserSession
 
 __all__ = [
     "AuditLog",
@@ -62,4 +63,5 @@ __all__ = [
     "TestCase",
     "UploadFileResource",
     "User",
+    "UserSession",
 ]

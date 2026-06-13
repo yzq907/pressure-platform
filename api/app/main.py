@@ -137,6 +137,7 @@ async def lifespan(app: FastAPI):
         ensure_report_snapshot_columns,
         ensure_scheduled_task_log_table,
         ensure_upload_file_table,
+        ensure_user_session_table,
     )
     await ensure_config_value_text_column()
     await ensure_ai_generation_tables()
@@ -151,6 +152,7 @@ async def lifespan(app: FastAPI):
     await ensure_report_transaction_snapshot_table()
     await ensure_report_transaction_metric_snapshot_table()
     await ensure_upload_file_table()
+    await ensure_user_session_table()
 
     # 初始化：创建 admin 用户（如不存在）
     async with session_module.AsyncSessionLocal() as db:

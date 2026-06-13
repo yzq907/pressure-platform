@@ -1103,6 +1103,23 @@ async def test_download_report_success(auth_client: AsyncClient, db: AsyncSessio
 
 
 @pytest.mark.asyncio
+async def test_download_report_sanitizes_task_name_for_zip_path(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_dir = str(tmp_path / "2026-05-13-11:30:00" / "data")
+    os.makedirs(report_dir, exist_ok=True)
+    (tmp_path / "2026-05-13-11:30:00" / "data" / "index.html").write_text("<html>report</html>")
+
+    rid = await _insert_report(db, name="baseline/after", exec_type=ExecType.EXEC.value, report_dir=report_dir)
+    resp = await auth_client.get(f"/report/download/{rid}")
+
+    assert resp.status_code == 200
+    assert "baseline_after.zip" in resp.headers["content-disposition"]
+
+
+@pytest.mark.asyncio
 async def test_view_debug_report_blocked(auth_client: AsyncClient, db: AsyncSession) -> None:
     rid = await _insert_report(db, name="debug_view", exec_type=ExecType.DEBUG.value)
     resp = await auth_client.get(f"/report/view/{rid}")

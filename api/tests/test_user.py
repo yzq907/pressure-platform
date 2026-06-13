@@ -107,6 +107,25 @@ async def test_login_success(client: AsyncClient, db: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_login_allows_multiple_active_tokens_for_same_user(client: AsyncClient, db: AsyncSession) -> None:
+    await _create_user(db, "multi_login", "Password123", "Multi")
+
+    first_login = await client.post("/user/login", json={"username": "multi_login", "password": "Password123"})
+    first_token = first_login.json()["data"]
+    second_login = await client.post("/user/login", json={"username": "multi_login", "password": "Password123"})
+    second_token = second_login.json()["data"]
+
+    assert first_token != second_token
+    first_resp = await client.get("/_test/whoami", headers={"token": first_token})
+    second_resp = await client.get("/_test/whoami", headers={"token": second_token})
+
+    assert first_resp.json()["code"] == 0
+    assert first_resp.json()["data"]["username"] == "multi_login"
+    assert second_resp.json()["code"] == 0
+    assert second_resp.json()["data"]["username"] == "multi_login"
+
+
+@pytest.mark.asyncio
 async def test_login_wrong_password(client: AsyncClient, db: AsyncSession) -> None:
     await _create_user(db, "eve", "correct")
     resp = await client.post("/user/login", json={"username": "eve", "password": "wrong"})

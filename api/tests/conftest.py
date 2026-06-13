@@ -248,10 +248,14 @@ def mock_ssh(request, monkeypatch) -> Any:
         if "jmeter-server" in command and "rmi.server.hostname" in command:
             state["jmeter_started"] = True
             return "Using local port: 1099"
-        # ps 检查
-        if "ps aux" in command and "grep jmeter-server" in command:
-            if "kill" in command:
-                return ""
+        # ps / kill 检查
+        if "kill" in command and ("ApacheJMeter.jar" in command or "jmeter-server" in command):
+            state["jmeter_started"] = False
+            return ""
+        if (
+            ("ps aux" in command and "grep jmeter-server" in command)
+            or ("ApacheJMeter.jar" in command and "grep" in command)
+        ):
             return "root  12345 ... jmeter-server" if state["jmeter_started"] else "null"
         # md5sum
         if "md5sum" in command:

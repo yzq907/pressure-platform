@@ -81,8 +81,11 @@ INIT_ARTIFACT_TESTCASE_IDS_KEY = "INIT_ARTIFACT_TESTCASE_IDS"
 _REMOTE_STOP_WAIT_SECONDS = 3
 _REMOTE_RESTART_WAIT_SECONDS = 3
 _REMOTE_RESTART_ATTEMPTS = 2
-_JMETER_SERVER_PS_CMD = "ps aux | grep jmeter-server | grep -v grep"
-_JMETER_SERVER_KILL_CMD = "ps aux | grep jmeter-server | grep -v grep | awk '{print $2}' | xargs kill -9"
+_JMETER_SERVER_PS_CMD = "ps -ef | grep 'ApacheJMeter.jar' | grep ' -s ' | grep -v grep"
+_JMETER_SERVER_KILL_CMD = (
+    "ps -ef | awk '/ApacheJMeter.jar/ && / -s / {print $2}' | xargs -r kill -9; "
+    "ps -ef | awk '/jmeter-server/ && !/awk/ {print $2}' | xargs -r kill -9"
+)
 
 # Java 端 addTestCase 校验：name 不能含空格或 #
 _BAD_NAME_CHARS = re.compile(r"[\s#]")
@@ -292,6 +295,13 @@ async def _ensure_master_bin(db: AsyncSession, action: str) -> str:
 
 def _ts_now() -> str:
     return datetime.now(SHANGHAI).strftime("%Y-%m-%d-%H:%M:%S")
+
+
+def _resolve_run_report_name(testcase_name: str, task_name: str | None, ts: str) -> str:
+    display_name = (task_name or "").strip()
+    if not display_name:
+        display_name = f"{testcase_name}_{ts}"
+    return display_name[:255]
 
 
 def _cleanup_old_run_jmx(jmx_dir: str, testcase_id: int, keep: int = 5) -> None:
@@ -841,6 +851,7 @@ async def _run_testcase_now(
     # 清理旧 run_*.jmx，只保留最近 5 个
     _cleanup_old_run_jmx(jmx.jmx_dir, id, keep=5)
 
+    report_display_name = _resolve_run_report_name(testcase.name, param.task_name, ts)
     jtl_dir, log_dir, data_dir = _prepare_report_dirs(testcase.test_case_dir, ts)
     jtl_path = jtl_dir + testcase.name + ".jtl"
     log_path = log_dir + f"jmeter_{ts}.log"
@@ -889,7 +900,7 @@ async def _run_testcase_now(
     report_id = await report_service.add_report(
         db,
         ReportParam(
-            name=testcase.name,
+            name=report_display_name,
             description=testcase.description,
             test_case_id=id,
             report_dir=data_dir,
@@ -905,7 +916,7 @@ async def _run_testcase_now(
                 db,
                 service_name=testcase.service,
                 testcase_name=testcase.name,
-                report_name=testcase.name,
+                report_name=report_display_name,
             ),
             artifact_dir=artifact_dir,
         ),
@@ -1066,10 +1077,10 @@ async def stop_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:
     for rpt in running_reports:
         ok = await jmeter_runner.launch_stop(rpt.id)
         log.info("[stop] report_id=%s region=%s ok=%s", rpt.id, rpt.region, ok)
+        await execution_node_service.release_by_report(db, rpt.id, message="用户手动停止，释放压力机租约")
         remote_message = await _stop_remote_engines(db, rpt)
         _mark_report_stopped(testcase, rpt, ok, remote_message)
         await _mark_execution_queue_stopped(db, rpt.id, f"用户手动停止{remote_message}")
-        await execution_node_service.release_by_report(db, rpt.id, message=f"用户手动停止{remote_message}")
     await db.commit()
     return True
 
@@ -1084,11 +1095,11 @@ async def stop_execution(db: AsyncSession, report_id: int, user: UserContext) ->
 
     log.info("[stop execution] report_id=%s region=%s", report_id, rpt.region)
     stopped = await jmeter_runner.launch_stop(report_id)
+    await execution_node_service.release_by_report(db, rpt.id, message="用户手动停止，释放压力机租约")
     remote_message = await _stop_remote_engines(db, rpt)
     testcase = await crud.get_by_id(db, rpt.test_case_id)
     _mark_report_stopped(testcase, rpt, stopped, remote_message)
     await _mark_execution_queue_stopped(db, rpt.id, f"用户手动停止{remote_message}")
-    await execution_node_service.release_by_report(db, rpt.id, message=f"用户手动停止{remote_message}")
     await db.commit()
     return True
 
@@ -1171,17 +1182,19 @@ async def _stop_remote_engine(node, slave_bin: str, slave_log: str) -> bool:
         await asyncio.sleep(_REMOTE_STOP_WAIT_SECONDS)
 
     ps_after_shutdown = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
-    if not _remote_jmeter_server_running(ps_after_shutdown):
-        return False
+    server_still_running = _remote_jmeter_server_running(ps_after_shutdown)
 
     start_cmd = (
-        f"cd {shlex.quote(slave_log)} && "
-        f"{shlex.quote(f'{slave_bin}/jmeter-server')} -Djava.rmi.server.hostname={shlex.quote(node.host)}"
+        f"mkdir -p {shlex.quote(slave_log)} && cd {shlex.quote(slave_log)} && "
+        f"nohup {shlex.quote(f'{slave_bin}/jmeter-server')} "
+        f"-Djava.rmi.server.hostname={shlex.quote(node.host)} "
+        f"> jmeter-server.log 2>&1 & echo $!"
     )
     last_start_output = ""
     last_ps_output = ""
     for attempt in range(1, _REMOTE_RESTART_ATTEMPTS + 1):
-        await ssh.exec_command(_JMETER_SERVER_KILL_CMD)
+        if server_still_running:
+            await ssh.exec_command(_JMETER_SERVER_KILL_CMD)
         result = await ssh.exec_command(start_cmd)
         last_start_output = result
         log.info("重启远程 jmeter-server host=%s attempt=%s output=%s", node.host, attempt, result)
@@ -1192,6 +1205,7 @@ async def _stop_remote_engine(node, slave_bin: str, slave_log: str) -> bool:
         last_ps_output = ps_after_restart
         if _remote_jmeter_server_running(ps_after_restart) or _remote_jmeter_server_started(result, node.host):
             return True
+        server_still_running = _remote_jmeter_server_running(ps_after_restart)
 
     raise RuntimeError(
         f"jmeter-server restart not verified, output={last_start_output}, ps={last_ps_output}"

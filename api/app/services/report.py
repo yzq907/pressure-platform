@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import zipfile
 from datetime import datetime, timedelta
@@ -85,6 +86,12 @@ async def _to_vo_list_with_occupied_nodes(db: AsyncSession, items: list[Report])
 
     host_map = await execution_node.active_hosts_by_report_ids(db, [item.id for item in items])
     return [_to_vo(item, host_map.get(item.id, [])) for item in items]
+
+
+def _safe_report_archive_name(name: str | None) -> str:
+    safe = re.sub(r'[\\/:*?"<>|\r\n]+', "_", (name or "").strip())
+    safe = safe.strip(" ._")
+    return (safe or "report")[:120]
 
 
 async def add_report(db: AsyncSession, param: ReportParam, user: UserContext) -> int:
@@ -262,7 +269,7 @@ async def download_report(db: AsyncSession, id: int) -> str:
     # reportDir 以 /data/ 结尾，取前面部分
     report_path = report_dir[: report_dir.rfind("data")]
     src_path = report_path + "data"
-    zip_path = report_path + report.name + ".zip"
+    zip_path = report_path + _safe_report_archive_name(report.name) + ".zip"
 
     if not os.path.exists(zip_path):
         _compress_directory(src_path, zip_path)

@@ -21,6 +21,7 @@ from app.core.exceptions import MysteriousException
 from app.core.permissions import DEFAULT_ROLE_CODE
 from app.crud import role as role_crud
 from app.crud import user as user_crud
+from app.crud import user_session as user_session_crud
 from app.db.session import get_db
 
 log = logging.getLogger(__name__)
@@ -47,16 +48,25 @@ async def get_current_user_dep(
         log.warning("missing token at %s", request.url.path)
         raise MysteriousException(Codes.USER_NOT_LOGIN)
 
-    user = await user_crud.get_by_token(db, token)
+    session = await user_session_crud.get_by_token(db, token)
+    user = await user_crud.get_by_id(db, session.user_id) if session is not None else None
+    token_expire_time = session.expire_time if session is not None else None
+    if user is None:
+        user = await user_crud.get_by_token(db, token)
+        token_expire_time = user.expire_time if user is not None else None
     if user is None:
         log.warning("user not found for token at %s", request.url.path)
         raise MysteriousException(Codes.USER_NOT_EXIST)
 
     # MySQL DATETIME 是无时区的，按 Asia/Shanghai 本地时间解读
     now_local = datetime.now(SHANGHAI).replace(tzinfo=None)
-    if user.expire_time < now_local:
+    if token_expire_time < now_local or user.expire_time < now_local:
         log.warning(
-            "token expired at %s (expire=%s now=%s)", request.url.path, user.expire_time, now_local
+            "token expired at %s (expire=%s user_expire=%s now=%s)",
+            request.url.path,
+            token_expire_time,
+            user.expire_time,
+            now_local,
         )
         raise MysteriousException(Codes.USER_TOKEN_EXPIRE)
 

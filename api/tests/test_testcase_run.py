@@ -310,6 +310,63 @@ async def test_run_creates_report_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_run_uses_task_name_as_report_name(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+) -> None:
+    case_id = await _create_case_with_jmx(auth_client, "r_task_name_case", sample_jmx_bytes)
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={
+            "taskName": "登录接口-100并发-基线",
+            "numThreads": "10",
+            "rampTime": "0",
+            "duration": "60",
+            "slaveCount": 0,
+        },
+    )
+
+    assert resp.json()["code"] == 0
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+    report = (await db.execute(select(Report).where(Report.test_case_id == case_id))).scalars().one()
+    assert report.name == "登录接口-100并发-基线"
+
+
+@pytest.mark.asyncio
+async def test_run_generates_distinct_report_name_when_task_name_is_blank(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+) -> None:
+    case_id = await _create_case_with_jmx(auth_client, "r_default_task_name", sample_jmx_bytes)
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={
+            "taskName": "   ",
+            "numThreads": "10",
+            "rampTime": "0",
+            "duration": "60",
+            "slaveCount": 0,
+        },
+    )
+
+    assert resp.json()["code"] == 0
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+    report = (await db.execute(select(Report).where(Report.test_case_id == case_id))).scalars().one()
+    assert report.name.startswith("r_default_task_name_")
+    assert report.name != "r_default_task_name"
+
+
+@pytest.mark.asyncio
 async def test_run_applies_thread_group_overrides(
     auth_client: AsyncClient,
     data_home: Path,
@@ -1219,7 +1276,7 @@ async def test_stop_execution_restarts_busy_remote_slave_engine(
 
     async def tracking_exec(self, command: str) -> str:
         commands.append(command)
-        if "ps aux" in command and "grep jmeter-server" in command and "kill" not in command:
+        if "ApacheJMeter.jar" in command and "grep" in command and "kill" not in command:
             return "root 12345 ... jmeter-server"
         if "jmeter-server" in command and "rmi.server.hostname" in command:
             return "Using local port: 1099"
@@ -1266,7 +1323,7 @@ async def test_stop_execution_restarts_busy_remote_slave_engine(
 
     assert resp.json()["code"] == 0
     assert any("/opt/jmeter/bin/shutdown.sh" in cmd for cmd in commands)
-    assert any("xargs kill -9" in cmd for cmd in commands)
+    assert any("kill -9" in cmd for cmd in commands)
     assert any("jmeter-server -Djava.rmi.server.hostname=10.10.27.97" in cmd for cmd in commands)
 
     await jmeter_runner._update_testcase_and_report(
@@ -1280,6 +1337,155 @@ async def test_stop_execution_restarts_busy_remote_slave_engine(
     assert tc.status == TestCaseStatus.RUN_FAILED.value
     assert rpt.status == TestCaseStatus.RUN_FAILED.value
     assert "用户手动停止" in rpt.response_data
+
+
+@pytest.mark.asyncio
+async def test_stop_execution_restarts_remote_slave_engine_after_shutdown_stops_it(
+    auth_client: AsyncClient,
+    tmp_path: Path,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    """shutdown.sh 已停掉 jmeter-server 时，也必须重新拉起，避免节点变成未启动。"""
+    from app.core import ssh as ssh_mod
+    from app.services import testcase as testcase_service
+
+    monkeypatch.setattr(jmeter_runner, "launch_stop", lambda report_id: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(testcase_service, "_REMOTE_STOP_WAIT_SECONDS", 0)
+    monkeypatch.setattr(testcase_service, "_REMOTE_RESTART_WAIT_SECONDS", 0)
+
+    commands: list[str] = []
+    server_started = False
+
+    async def tracking_exec(self, command: str) -> str:
+        nonlocal server_started
+        commands.append(command)
+        if "ApacheJMeter.jar" in command and "grep" in command and "kill" not in command:
+            return "root 12345 ... jmeter-server" if server_started else "null"
+        if "jmeter-server" in command and "rmi.server.hostname" in command:
+            server_started = True
+            return "Using local port: 1099"
+        return "null"
+
+    monkeypatch.setattr(ssh_mod.SSHClient, "exec_command", tracking_exec)
+
+    db.add(Config(config_key="SLAVE_JMETER_BIN_HOME", config_value="/opt/jmeter/bin"))
+    db.add(Config(config_key="SLAVE_JMETER_LOG_HOME", config_value="/opt/jmeter/log"))
+    node = Node(
+        name="slave-98",
+        type=NodeType.SLAVE.value,
+        host="10.10.27.98",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+    )
+    db.add(node)
+    tc = TestCase(name="remote_stop_shutdown_stopped", status=TestCaseStatus.RUN_ING.value, test_case_dir=str(tmp_path))
+    db.add(tc)
+    await db.commit()
+    await db.refresh(tc)
+
+    report_root = tmp_path / "report" / "2026-06-09-15:01:22"
+    data_dir = report_root / "data"
+    data_dir.mkdir(parents=True)
+    (report_root / "run_meta.json").write_text(
+        '{"slave_hosts":["10.10.27.98:1099"]}',
+        encoding="utf-8",
+    )
+    rpt = Report(
+        name="remote_stop_shutdown_stopped",
+        test_case_id=tc.id,
+        report_dir=str(data_dir) + os.sep,
+        status=TestCaseStatus.RUN_ING.value,
+    )
+    db.add(rpt)
+    await db.commit()
+    await db.refresh(rpt)
+
+    resp = await auth_client.get(f"/testcase/stopExecution/{rpt.id}")
+
+    assert resp.json()["code"] == 0
+    assert any("/opt/jmeter/bin/shutdown.sh" in cmd for cmd in commands)
+    assert any("jmeter-server -Djava.rmi.server.hostname=10.10.27.98" in cmd for cmd in commands)
+    await db.refresh(node)
+    assert node.health_status == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_execution_releases_node_lease_before_remote_cleanup(
+    auth_client: AsyncClient,
+    tmp_path: Path,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    """停止执行时先释放节点租约，避免远程清理耗时导致节点一直显示占用。"""
+    from app.services import testcase as testcase_service
+
+    monkeypatch.setattr(jmeter_runner, "launch_stop", lambda report_id: asyncio.sleep(0, result=True))
+
+    node = Node(
+        name="lease-stop-slave",
+        type=NodeType.SLAVE.value,
+        host="10.10.27.99",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.ENABLE.value,
+        health_status=1,
+    )
+    db.add(node)
+    tc = TestCase(name="remote_stop_release_first", status=TestCaseStatus.RUN_ING.value, test_case_dir=str(tmp_path))
+    db.add(tc)
+    await db.commit()
+    await db.refresh(node)
+    await db.refresh(tc)
+
+    report_root = tmp_path / "report" / "2026-06-09-15:02:22"
+    data_dir = report_root / "data"
+    data_dir.mkdir(parents=True)
+    rpt = Report(
+        name="remote_stop_release_first",
+        test_case_id=tc.id,
+        report_dir=str(data_dir) + os.sep,
+        status=TestCaseStatus.RUN_ING.value,
+    )
+    db.add(rpt)
+    await db.commit()
+    await db.refresh(rpt)
+    db.add(
+        ExecutionNode(
+            report_id=rpt.id,
+            test_case_id=tc.id,
+            node_id=node.id,
+            node_host=node.host,
+            region="default",
+            status="leased",
+        )
+    )
+    await db.commit()
+
+    observed_statuses: list[str] = []
+
+    async def assert_lease_released(remote_db: AsyncSession, report: Report) -> str:
+        leases = (
+            await remote_db.execute(select(ExecutionNode).where(ExecutionNode.report_id == report.id))
+        ).scalars().all()
+        observed_statuses.extend(lease.status for lease in leases)
+        return "；已重启压力机: 10.10.27.99"
+
+    monkeypatch.setattr(testcase_service, "_stop_remote_engines", assert_lease_released)
+
+    resp = await auth_client.get(f"/testcase/stopExecution/{rpt.id}")
+
+    assert resp.json()["code"] == 0
+    assert observed_statuses == ["released"]
+    lease = (
+        await db.execute(select(ExecutionNode).where(ExecutionNode.report_id == rpt.id))
+    ).scalar_one()
+    assert lease.status == "released"
+    assert lease.released_at is not None
 
 
 @pytest.mark.asyncio
@@ -1301,7 +1507,7 @@ async def test_stop_execution_marks_remote_slave_unhealthy_when_restart_fails(
 
     async def failed_restart_exec(self, command: str) -> str:
         nonlocal ps_checks
-        if "ps aux" in command and "grep jmeter-server" in command and "kill" not in command:
+        if "ApacheJMeter.jar" in command and "grep" in command and "kill" not in command:
             ps_checks += 1
             if ps_checks == 1:
                 return "root 12345 ... jmeter-server"
@@ -1314,10 +1520,11 @@ async def test_stop_execution_marks_remote_slave_unhealthy_when_restart_fails(
 
     db.add(Config(config_key="SLAVE_JMETER_BIN_HOME", config_value="/opt/jmeter/bin"))
     db.add(Config(config_key="SLAVE_JMETER_LOG_HOME", config_value="/opt/jmeter/log"))
+    slave_host = "10.10.27.111"
     node = Node(
         name="slave-111",
         type=NodeType.SLAVE.value,
-        host="10.10.27.111",
+        host=slave_host,
         username="root",
         password="x",
         port=22,
@@ -1334,7 +1541,7 @@ async def test_stop_execution_marks_remote_slave_unhealthy_when_restart_fails(
     data_dir = report_root / "data"
     data_dir.mkdir(parents=True)
     (report_root / "run_meta.json").write_text(
-        '{"slave_hosts":["10.10.27.111:1099"]}',
+        json.dumps({"slave_hosts": [f"{slave_host}:1099"]}),
         encoding="utf-8",
     )
     rpt = Report(
@@ -1353,7 +1560,7 @@ async def test_stop_execution_marks_remote_slave_unhealthy_when_restart_fails(
     await db.refresh(node)
     await db.refresh(rpt)
     assert node.health_status == 0
-    assert "压力机清理失败: 10.10.27.111" in rpt.response_data
+    assert f"压力机清理失败: {slave_host}" in rpt.response_data
 
 
 @pytest.mark.asyncio
