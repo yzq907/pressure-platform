@@ -215,9 +215,15 @@ async def test_report_resource_metrics_queries_prometheus(
     assert data["instance"] == "10.10.27.42:9200"
     assert data["step"] == 30
     assert data["series"]["cpu"][0]["value"] == 12.5
+    assert data["series"]["diskUtil"][0]["value"] == 12.5
     assert captured
     assert all(item["base_url"] == "http://prometheus.example" for item in captured)
     assert any('instance="10.10.27.42:9200"' in item["query"] for item in captured)
+    disk_queries = [item["query"] for item in captured if "node_disk_" in item["query"]]
+    assert any("irate(node_disk_read_bytes_total" in query for query in disk_queries)
+    assert any("irate(node_disk_written_bytes_total" in query for query in disk_queries)
+    assert any("irate(node_disk_io_time_seconds_total" in query for query in disk_queries)
+    assert all('device!~"^(dm-|loop|ram|fd|sr).*"' in query for query in disk_queries)
 
 
 @pytest.mark.asyncio
@@ -1397,6 +1403,51 @@ async def test_get_jtl_metrics_refreshes_running_report_snapshot(
     items = await report_service.get_jtl_metrics(db, rid, 5)
 
     assert items
+    assert scheduled == [(rid, (5,))]
+
+
+@pytest.mark.asyncio
+async def test_get_jtl_metrics_uses_configured_running_refresh_interval(
+    db: AsyncSession,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="REPORT_RUNNING_METRIC_REFRESH_SECONDS", config_value="30"))
+    report_root = tmp_path / "report" / "2026-06-01-16:03:00"
+    data_dir = report_root / "data"
+    data_dir.mkdir(parents=True)
+    rid = await _insert_report(
+        db,
+        name="snapshot_running_config_interval",
+        status=TestCaseStatus.RUN_ING.value,
+        report_dir=str(data_dir) + os.sep,
+    )
+    db.add(
+        ReportMetricSnapshot(
+            report_id=rid,
+            window_sec=5,
+            bucket_start_ms=1700000000000,
+            timestamp="10:00:00",
+            qps=1.0,
+        )
+    )
+    await db.commit()
+
+    scheduled: list[tuple[int, tuple[int, ...]]] = []
+
+    def fake_schedule(report_id: int, windows=(5,)) -> bool:
+        scheduled.append((report_id, tuple(windows)))
+        return True
+
+    monkeypatch.setattr(report_metrics_service, "schedule_metric_snapshot_generation", fake_schedule)
+    monkeypatch.setattr(report_metrics_service, "_metric_snapshot_last_refresh", {}, raising=False)
+
+    report_metrics_service._metric_snapshot_last_refresh[(rid, 5)] = report_metrics_service.time.monotonic() - 11
+    await report_service.get_jtl_metrics(db, rid, 5)
+    assert scheduled == []
+
+    report_metrics_service._metric_snapshot_last_refresh[(rid, 5)] = report_metrics_service.time.monotonic() - 31
+    await report_service.get_jtl_metrics(db, rid, 5)
     assert scheduled == [(rid, (5,))]
 
 

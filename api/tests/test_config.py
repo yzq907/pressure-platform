@@ -160,6 +160,18 @@ async def test_ensure_default_configs_adds_prometheus_step_to_config_list(
     assert item["displayName"] == "Prometheus默认查询步长秒"
     assert item["valueType"] == "number"
 
+    resp = await auth_client.get("/config/list?page=1&size=50&category=report")
+    page = resp.json()["data"]
+    item = next(
+        config for config in page["list"] if config["configKey"] == "REPORT_RUNNING_METRIC_REFRESH_SECONDS"
+    )
+
+    assert item["configValue"] == "30"
+    assert item["description"] == "运行中报告指标刷新间隔秒"
+    assert item["category"] == "report"
+    assert item["displayName"] == "运行中报告指标刷新间隔秒"
+    assert item["valueType"] == "number"
+
 
 @pytest.mark.asyncio
 async def test_ensure_default_configs_does_not_overwrite_existing_value(

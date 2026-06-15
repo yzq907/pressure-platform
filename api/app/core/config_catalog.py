@@ -70,6 +70,7 @@ CONFIG_META: dict[str, ConfigMeta] = {
     "PROMETHEUS_TO_OFFSET_MINUTES": ConfigMeta("prometheus", "Prometheus结束时间偏移分钟", "number", 90),
     "MASTER_DATA_HOME": ConfigMeta("report", "Master数据和报告目录", "path", 10),
     "MASTER_HOST_PORT": ConfigMeta("report", "报告预览Host", "text", 20),
+    "REPORT_RUNNING_METRIC_REFRESH_SECONDS": ConfigMeta("report", "运行中报告指标刷新间隔秒", "number", 30),
     "INIT_ARTIFACT_TESTCASE_IDS": ConfigMeta("init_data", "初始化产物用例ID", "text", 10),
     "AI_GENERATION_WORK_DIR": ConfigMeta("ai_generation", "AI生成工作目录", "path", 10),
     "AI_GENERATION_TIMEOUT_SECONDS": ConfigMeta("ai_generation", "AI生成超时时间秒", "number", 20),
@@ -81,6 +82,7 @@ CONFIG_META: dict[str, ConfigMeta] = {
 
 DEFAULT_CONFIG_VALUES: dict[str, str] = {
     "PROMETHEUS_STEP_SECONDS": "30",
+    "REPORT_RUNNING_METRIC_REFRESH_SECONDS": "30",
 }
 
 

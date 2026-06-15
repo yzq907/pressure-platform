@@ -25,7 +25,17 @@ from app.services import config as config_service
 
 log = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-DEFAULT_PROMETHEUS_RESOURCE_METRICS = ("cpu", "memory", "load", "networkIn", "networkOut", "diskRead", "diskWrite", "gc")
+DEFAULT_PROMETHEUS_RESOURCE_METRICS = (
+    "cpu",
+    "memory",
+    "load",
+    "networkIn",
+    "networkOut",
+    "diskRead",
+    "diskWrite",
+    "diskUtil",
+    "gc",
+)
 
 def _to_epoch_ms(dt: datetime | None) -> int:
     if dt is None:
@@ -101,6 +111,7 @@ def _quote_prom_label(value: str) -> str:
 
 def _prometheus_resource_queries(instance: str, instance_label: str) -> dict[str, str]:
     selector = f'{instance_label}="{_quote_prom_label(instance)}"'
+    disk_selector = f'{selector},device!~"^(dm-|loop|ram|fd|sr).*"'
     return {
         "cpu": (
             "100 - (avg(rate(node_cpu_seconds_total{"
@@ -125,8 +136,13 @@ def _prometheus_resource_queries(instance: str, instance_label: str) -> dict[str
             f'{selector},device!="lo"'
             "}[1m]))"
         ),
-        "diskRead": f"sum(rate(node_disk_read_bytes_total{{{selector}}}[1m]))",
-        "diskWrite": f"sum(rate(node_disk_written_bytes_total{{{selector}}}[1m]))",
+        "diskRead": f"sum(irate(node_disk_read_bytes_total{{{disk_selector}}}[1m]))",
+        "diskWrite": f"sum(irate(node_disk_written_bytes_total{{{disk_selector}}}[1m]))",
+        "diskUtil": (
+            "max(irate(node_disk_io_time_seconds_total{"
+            f"{disk_selector}"
+            "}[1m])) * 100"
+        ),
         "gc": f"sum(rate(jvm_gc_pause_seconds_sum{{{selector}}}[1m]))",
     }
 

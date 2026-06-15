@@ -22,12 +22,14 @@ from app.crud import report as crud
 from app.db import session as session_module
 from app.models.report import Report
 from app.models.report_metric_snapshot import ReportMetricSnapshot
+from app.services import config as config_service
 
 log = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_METRIC_WINDOWS = (5,)
 _metric_snapshot_tasks: set[tuple[int, tuple[int, ...]]] = set()
-_METRIC_RUNNING_REFRESH_INTERVAL_SECONDS = 10.0
+_DEFAULT_RUNNING_METRIC_REFRESH_SECONDS = 30.0
+_RUNNING_METRIC_REFRESH_CONFIG_KEY = "REPORT_RUNNING_METRIC_REFRESH_SECONDS"
 _metric_snapshot_last_refresh: dict[tuple[int, int], float] = {}
 
 def _find_jtl_file(report_dir: str) -> str | None:
@@ -346,13 +348,29 @@ def schedule_metric_snapshot_generation(
     task.add_done_callback(lambda done_task: _on_metric_snapshot_task_done(report_id, key, done_task))
     return True
 
-def _maybe_refresh_running_metric_snapshot(rpt: Report, window_sec: int) -> None:
+def _parse_running_metric_refresh_seconds(raw: str | None) -> float:
+    try:
+        value = float(raw or _DEFAULT_RUNNING_METRIC_REFRESH_SECONDS)
+    except (TypeError, ValueError):
+        return _DEFAULT_RUNNING_METRIC_REFRESH_SECONDS
+    return max(5.0, value)
+
+async def _running_metric_refresh_seconds(db: AsyncSession) -> float:
+    raw = await config_service.get_value_or_default(
+        db,
+        _RUNNING_METRIC_REFRESH_CONFIG_KEY,
+        str(int(_DEFAULT_RUNNING_METRIC_REFRESH_SECONDS)),
+    )
+    return _parse_running_metric_refresh_seconds(raw)
+
+async def _maybe_refresh_running_metric_snapshot(db: AsyncSession, rpt: Report, window_sec: int) -> None:
     if rpt.status != TestCaseStatus.RUN_ING.value:
         return
     key = (rpt.id, window_sec)
     now = time.monotonic()
     last_refresh = _metric_snapshot_last_refresh.get(key, 0.0)
-    if now - last_refresh < _METRIC_RUNNING_REFRESH_INTERVAL_SECONDS:
+    refresh_seconds = await _running_metric_refresh_seconds(db)
+    if now - last_refresh < refresh_seconds:
         return
     _metric_snapshot_last_refresh[key] = now
     schedule_metric_snapshot_generation(rpt.id, (window_sec,))
@@ -390,7 +408,7 @@ async def get_jtl_metrics(
 
     snapshots = await _list_metric_snapshots(db, report_id, window_sec)
     if snapshots:
-        _maybe_refresh_running_metric_snapshot(rpt, window_sec)
+        await _maybe_refresh_running_metric_snapshot(db, rpt, window_sec)
         return snapshots
 
     if rpt.status == TestCaseStatus.RUN_ING.value:
