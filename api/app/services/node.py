@@ -73,9 +73,13 @@ async def update_node(
         return False
 
     sent = param.model_dump(exclude_unset=True, exclude_none=True, by_alias=False)
-    for field in ("name", "description", "type", "host", "username", "password", "port", "region"):
+    for field in ("name", "description", "type", "host", "username", "port", "region"):
         if field in sent:
             setattr(existing, field, sent[field])
+    if "password" in sent:
+        password = str(sent["password"] or "").strip()
+        if password and password != "******":
+            existing.password = password
     stamp_modify(existing, user)
     return await crud.update(db, existing)
 
@@ -84,8 +88,7 @@ async def get_by_id(db: AsyncSession, id: int) -> NodeVO | None:
     obj = await crud.get_by_id(db, id)
     if obj is None:
         return None
-    # Java 行为：getById 不脱敏密码
-    return _to_vo(obj, mask_password=False)
+    return _to_vo(obj, mask_password=True)
 
 
 async def delete_node(db: AsyncSession, id: int) -> bool:

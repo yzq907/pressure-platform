@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -194,10 +194,11 @@ async def get_resource_metrics(
     id: int,
     step: int | None = None,
     instance: str | None = None,
+    force_refresh: bool = Query(False, alias="forceRefresh"),
     current: UserContext = Depends(require_permission(PERMISSION_REPORT)),
     db: AsyncSession = Depends(get_db),
 ) -> Response[ResourceMetricsVO]:
-    items = await service.get_resource_metrics(db, id, step, instance)
+    items = await service.get_resource_metrics(db, id, step, instance, force_refresh)
     return success(items)
 
 

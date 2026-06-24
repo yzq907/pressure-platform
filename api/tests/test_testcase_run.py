@@ -367,6 +367,37 @@ async def test_run_generates_distinct_report_name_when_task_name_is_blank(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload_patch", "expected_message"),
+    [
+        ({"numThreads": "abc"}, "并发数必须是正整数"),
+        ({"rampTime": "-1"}, "启动时间必须大于等于 0"),
+        ({"duration": "0"}, "运行时间必须是正整数"),
+    ],
+)
+async def test_run_rejects_invalid_global_run_params_without_creating_report(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+    payload_patch: dict,
+    expected_message: str,
+) -> None:
+    case_id = await _create_case_with_jmx(auth_client, "r_invalid_run_param", sample_jmx_bytes)
+    payload = {"numThreads": "10", "rampTime": "0", "duration": "60", "slaveCount": 0}
+    payload.update(payload_patch)
+
+    resp = await auth_client.post(f"/testcase/run/{case_id}", json=payload)
+    body = resp.json()
+
+    assert body["code"] == 1002
+    assert expected_message in body["message"]
+    reports = (await db.execute(select(Report).where(Report.test_case_id == case_id))).scalars().all()
+    assert reports == []
+
+
+@pytest.mark.asyncio
 async def test_run_applies_thread_group_overrides(
     auth_client: AsyncClient,
     data_home: Path,
@@ -428,7 +459,7 @@ async def test_run_applies_thread_group_overrides(
     assert values[("Default ThreadGroup", "ThreadGroup.ramp_time")] == "1"
     assert values[("Default ThreadGroup", "ThreadGroup.duration")] == "600"
     assert values[("Concurrency Group", "TargetLevel")] == "100"
-    assert values[("Concurrency Group", "Hold")] == "300"
+    assert values[("Concurrency Group", "Hold")] == "600"
 
 
 @pytest.mark.asyncio
@@ -547,6 +578,56 @@ async def test_run_meta_total_threads_uses_sum_of_custom_thread_groups(
     meta = json.loads((report_root / "run_meta.json").read_text(encoding="utf-8"))
     assert meta["total_threads"] == 15
     assert meta["per_slave_threads"] == 15
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_invalid_custom_thread_group_params_without_creating_report(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+) -> None:
+    case_id = await _create_case_with_jmx(auth_client, "r_tg_invalid_param", sample_jmx_bytes)
+    for h in ("10.0.10.1", "10.0.10.2"):
+        db.add(
+            Node(
+                name=h,
+                type=NodeType.SLAVE.value,
+                host=h,
+                username="root",
+                password="x",
+                port=22,
+                status=NodeStatus.ENABLE.value,
+                health_status=1,
+            )
+        )
+    await db.commit()
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={
+            "numThreads": "30",
+            "rampTime": "10",
+            "duration": "600",
+            "slaveCount": 2,
+            "threadGroupOverrides": [
+                {
+                    "name": "Default ThreadGroup",
+                    "mode": "custom",
+                    "numThreads": "abc",
+                    "rampTime": "1",
+                    "pacingMs": 0,
+                }
+            ],
+        },
+    )
+    body = resp.json()
+
+    assert body["code"] == 1002
+    assert "线程组「Default ThreadGroup」并发数必须是正整数" in body["message"]
+    reports = (await db.execute(select(Report).where(Report.test_case_id == case_id))).scalars().all()
+    assert reports == []
 
 
 @pytest.mark.asyncio

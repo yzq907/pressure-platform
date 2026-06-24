@@ -28,6 +28,13 @@ from app.services import prometheus as prometheus_service
 from app.services.report import _parse_jtl_metrics
 
 
+@pytest.fixture(autouse=True)
+def _clear_prometheus_resource_metrics_cache():
+    prometheus_service._RESOURCE_METRICS_CACHE.clear()
+    yield
+    prometheus_service._RESOURCE_METRICS_CACHE.clear()
+
+
 async def _insert_report(
     db: AsyncSession,
     name: str = "rpt",
@@ -227,6 +234,52 @@ async def test_report_resource_metrics_queries_prometheus(
 
 
 @pytest.mark.asyncio
+async def test_report_resource_metrics_falls_back_to_dm_disk_queries_when_excluded_empty(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-dm-fallback",
+        exec_type=ExecType.EXEC.value,
+        grafana_instance="10.10.27.42:9200",
+    )
+    captured: list[str] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append(query)
+        if "node_disk_" in query and 'device!~"^(dm-|loop|ram|fd|sr).*"' in query:
+            return []
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
+
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
+
+    resp = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"]["series"]["diskRead"][0]["value"] == 12.5
+    assert body["data"]["series"]["diskWrite"][0]["value"] == 12.5
+    assert body["data"]["series"]["diskUtil"][0]["value"] == 12.5
+    excluded_disk_queries = [
+        query for query in captured
+        if "node_disk_" in query and 'device!~"^(dm-|loop|ram|fd|sr).*"' in query
+    ]
+    fallback_disk_queries = [
+        query for query in captured
+        if "node_disk_" in query and 'device!~"^(dm-|loop|ram|fd|sr).*"' not in query
+    ]
+    assert len(excluded_disk_queries) == 3
+    assert len(fallback_disk_queries) == 3
+    assert any("node_disk_read_bytes_total" in query for query in fallback_disk_queries)
+    assert any("node_disk_written_bytes_total" in query for query in fallback_disk_queries)
+    assert any("node_disk_io_time_seconds_total" in query for query in fallback_disk_queries)
+
+
+@pytest.mark.asyncio
 async def test_report_resource_metrics_uses_configured_step_when_request_omits_step(
     auth_client: AsyncClient,
     db: AsyncSession,
@@ -294,6 +347,68 @@ async def test_report_resource_metrics_queries_prometheus_metrics_concurrently(
 
 
 @pytest.mark.asyncio
+async def test_report_resource_metrics_reuses_short_ttl_cache_for_same_instance(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    prometheus_service._RESOURCE_METRICS_CACHE.clear()
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-cache",
+        exec_type=ExecType.EXEC.value,
+        grafana_instance="10.10.27.42:9200",
+    )
+    captured: list[str] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append(query)
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
+
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
+
+    first = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    second = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+
+    assert first.json()["code"] == 0
+    assert second.json()["code"] == 0
+    assert len(captured) == len(report_service.DEFAULT_PROMETHEUS_RESOURCE_METRICS)
+
+
+@pytest.mark.asyncio
+async def test_report_resource_metrics_force_refresh_bypasses_short_ttl_cache(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    prometheus_service._RESOURCE_METRICS_CACHE.clear()
+    db.add(Config(config_key="PROMETHEUS_BASE_URL", config_value="http://prometheus.example"))
+    await db.commit()
+    rid = await _insert_report(
+        db,
+        name="resource-metrics-cache-refresh",
+        exec_type=ExecType.EXEC.value,
+        grafana_instance="10.10.27.42:9200",
+    )
+    captured: list[str] = []
+
+    async def fake_query(base_url, query, start, end, step, timeout):
+        captured.append(query)
+        return [{"timestamp": "10:00:00", "timestamp_ms": 1717476000000, "value": 12.5}]
+
+    monkeypatch.setattr(prometheus_service, "_query_prometheus_range", fake_query)
+
+    first = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30")
+    second = await auth_client.get(f"/report/resourceMetrics/{rid}?step=30&forceRefresh=true")
+
+    assert first.json()["code"] == 0
+    assert second.json()["code"] == 0
+    assert len(captured) == len(report_service.DEFAULT_PROMETHEUS_RESOURCE_METRICS) * 2
+
+
+@pytest.mark.asyncio
 async def test_report_resource_targets_from_resource_group_map(
     auth_client: AsyncClient,
     db: AsyncSession,
@@ -357,6 +472,91 @@ async def test_report_resource_targets_from_resource_group_map(
             "service": "MYSQL",
             "instance": "10.8.83.145:9200",
         },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_resource_targets_from_resource_group_map_string_list(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    db.add(
+        Config(
+            config_key="PROMETHEUS_RESOURCE_GROUP_MAP",
+            config_value=json.dumps(
+                {
+                    "EMM-API": [
+                        "10.10.27.42:9200",
+                        "10.10.27.43:9200",
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    await db.commit()
+    rid = await _insert_report(db, name="emm-api-run", service_name="EMM-API")
+
+    resp = await auth_client.get(f"/report/resourceTargets/{rid}")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"] == [
+        {
+            "name": "EMM-API-1",
+            "role": "相关服务",
+            "service": "EMM-API",
+            "instance": "10.10.27.42:9200",
+        },
+        {
+            "name": "EMM-API-2",
+            "role": "相关服务",
+            "service": "EMM-API",
+            "instance": "10.10.27.43:9200",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_resource_targets_invalid_resource_group_falls_back(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    db.add_all(
+        [
+            Config(
+                config_key="PROMETHEUS_RESOURCE_GROUP_MAP",
+                config_value=json.dumps(
+                    {
+                        "EMM-API": [
+                            123,
+                            "",
+                            {"name": "missing-instance"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
+            Config(
+                config_key="PROMETHEUS_DEFAULT_INSTANCE",
+                config_value="10.10.27.99:9200",
+            ),
+        ]
+    )
+    await db.commit()
+    rid = await _insert_report(db, name="emm-api-run", service_name="EMM-API")
+
+    resp = await auth_client.get(f"/report/resourceTargets/{rid}")
+    body = resp.json()
+
+    assert body["code"] == 0
+    assert body["data"] == [
+        {
+            "name": "EMM-API",
+            "role": "被压服务",
+            "service": "EMM-API",
+            "instance": "10.10.27.99:9200",
+        }
     ]
 
 

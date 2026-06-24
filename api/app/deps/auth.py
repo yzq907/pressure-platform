@@ -1,6 +1,6 @@
-"""FastAPI 鉴权依赖。复刻 Java AuthInterceptor 行为：
+"""FastAPI 鉴权依赖。
 
-1. 优先从 Header `token` 取，回退到 query param `token`
+1. 从 Header `token` 取登录凭证
 2. 反查 `mysterious_user` 表，找不到 → USER_NOT_EXIST
 3. 用户存在但 expire_time 已过 → USER_TOKEN_EXPIRE
 4. 通过后把 UserContext 写到 ContextVar
@@ -30,12 +30,11 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _extract_token(request: Request) -> str | None:
-    """Header 优先，query param 兜底（对齐 TokenUtils.java）"""
+    """只接受 Header token，避免 URL token 进入历史记录、访问日志或 Referer。"""
     token = request.headers.get("token")
     if token:
         return token.strip()
-    token = request.query_params.get("token")
-    return token.strip() if token else None
+    return None
 
 
 async def get_current_user_dep(

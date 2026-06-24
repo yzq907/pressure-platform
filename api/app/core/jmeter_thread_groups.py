@@ -195,8 +195,6 @@ def _resolve_thread_values(
     duration: str,
 ) -> tuple[str, str, str] | None:
     override = overrides.get(key) or overrides.get(el.get("testname") or "")
-    if override and override.get("mode") == "fixed":
-        return None
     if override and override.get("mode") == "custom":
         return (
             str(override.get("num_threads") or num_threads),
@@ -236,8 +234,17 @@ def update_run_thread(
             el.set("enabled", "true" if as_bool(override.get("enabled")) else "false")
         if not is_enabled(el):
             continue
+        fixed_mode = bool(override and override.get("mode") == "fixed")
 
         if el.tag == "ThreadGroup" and el.get("testclass") == "ThreadGroup":
+            if fixed_mode:
+                set_named_props(el, {
+                    "LoopController.continue_forever": "true",
+                    "LoopController.loops": "-1",
+                    "ThreadGroup.duration": duration,
+                    "ThreadGroup.scheduler": "true",
+                })
+                continue
             values = _resolve_thread_values(el, key, overrides, num_threads, ramp_time, duration)
             if values is None:
                 continue
@@ -251,6 +258,9 @@ def update_run_thread(
                 "ThreadGroup.scheduler": "true",
             })
         elif el.tag == STEPPING_TG:
+            if fixed_mode:
+                set_named_props(el, {"flighttime": duration})
+                continue
             values = _resolve_thread_values(el, key, overrides, num_threads, ramp_time, duration)
             if values is None:
                 continue
@@ -265,6 +275,9 @@ def update_run_thread(
                 "rampUp": "1",
             })
         elif el.tag == CONCURRENCY_TG:
+            if fixed_mode:
+                set_named_props(el, {"Hold": duration})
+                continue
             values = _resolve_thread_values(el, key, overrides, num_threads, ramp_time, duration)
             if values is None:
                 continue

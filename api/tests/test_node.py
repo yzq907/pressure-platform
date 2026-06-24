@@ -183,6 +183,45 @@ async def test_update_node_success(auth_client: AsyncClient, db: AsyncSession) -
 
 
 @pytest.mark.asyncio
+async def test_update_node_password_only_when_explicit_new_value(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+) -> None:
+    add_resp = await auth_client.post(
+        "/node/add",
+        json={
+            "name": "n-password",
+            "type": 0,
+            "host": "10.0.0.22",
+            "username": "u",
+            "password": "old-secret",
+            "port": 22,
+        },
+    )
+    node_id = add_resp.json()["data"]
+
+    resp = await auth_client.post(f"/node/update/{node_id}", json={"description": "no password"})
+    assert resp.json()["data"] is True
+    obj = (await db.execute(select(Node).where(Node.id == node_id))).scalar_one()
+    assert obj.password == "old-secret"
+
+    resp = await auth_client.post(f"/node/update/{node_id}", json={"password": ""})
+    assert resp.json()["data"] is True
+    await db.refresh(obj)
+    assert obj.password == "old-secret"
+
+    resp = await auth_client.post(f"/node/update/{node_id}", json={"password": "******"})
+    assert resp.json()["data"] is True
+    await db.refresh(obj)
+    assert obj.password == "old-secret"
+
+    resp = await auth_client.post(f"/node/update/{node_id}", json={"password": "new-secret"})
+    assert resp.json()["data"] is True
+    await db.refresh(obj)
+    assert obj.password == "new-secret"
+
+
+@pytest.mark.asyncio
 async def test_get_node_by_id(auth_client: AsyncClient) -> None:
     add_resp = await auth_client.post(
         "/node/add",
@@ -193,8 +232,7 @@ async def test_get_node_by_id(auth_client: AsyncClient) -> None:
     body = resp.json()
     data = body["data"]
     assert data["host"] == "10.0.0.3"
-    # getById 不脱敏密码（Java 行为）
-    assert data["password"] == "pw"
+    assert data["password"] == "******"
     assert "createTime" in data
 
 

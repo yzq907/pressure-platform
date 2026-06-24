@@ -512,12 +512,56 @@ def _safe_path_part(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
+def _parse_run_int(value: object, field_name: str, *, minimum: int) -> int:
+    raw = str(value if value is not None else "").strip()
+    predicate = "必须是正整数" if minimum > 0 else "必须大于等于 0 的整数"
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError) as e:
+        raise MysteriousException(
+            Codes.PARAM_WRONG,
+            message=f"{field_name}{predicate}",
+        ) from e
+    if parsed < minimum:
+        raise MysteriousException(
+            Codes.PARAM_WRONG,
+            message=f"{field_name}{predicate}",
+        )
+    return parsed
+
+
+def _validate_run_params(
+    num_threads: object,
+    ramp_time: object,
+    duration: object,
+    overrides: list,
+) -> tuple[int, int, int]:
+    parsed_num_threads = _parse_run_int(num_threads, "并发数", minimum=1)
+    parsed_ramp_time = _parse_run_int(ramp_time, "启动时间", minimum=0)
+    parsed_duration = _parse_run_int(duration, "运行时间", minimum=1)
+    for item in overrides:
+        data = item.model_dump(by_alias=False) if hasattr(item, "model_dump") else dict(item or {})
+        if data.get("mode") != "custom":
+            continue
+        label = data.get("name") or data.get("key") or ""
+        prefix = f"线程组「{label}」" if label else "线程组"
+        if data.get("num_threads") not in (None, ""):
+            _parse_run_int(data.get("num_threads"), f"{prefix}并发数", minimum=1)
+        if data.get("ramp_time") not in (None, ""):
+            _parse_run_int(data.get("ramp_time"), f"{prefix}启动时间", minimum=0)
+        if data.get("pacing_ms") not in (None, ""):
+            _parse_run_int(data.get("pacing_ms"), f"{prefix}Pacing", minimum=0)
+    return parsed_num_threads, parsed_ramp_time, parsed_duration
+
+
 def _prepare_thread_group_overrides(param: RunParam, slave_count: int) -> list[dict]:
     overrides: list[dict] = []
     for item in param.thread_group_overrides:
         data = item.model_dump(by_alias=False)
         if data.get("mode") == "custom" and slave_count > 1 and data.get("num_threads") not in (None, ""):
-            data["num_threads"] = str(math.ceil(int(data["num_threads"]) / slave_count))
+            label = data.get("name") or data.get("key") or ""
+            thread_count = _parse_run_int(data["num_threads"], f"线程组「{label}」并发数", minimum=1)
+            data["num_threads"] = str(math.ceil(thread_count / slave_count))
         overrides.append(data)
     return overrides
 
@@ -700,6 +744,10 @@ async def _should_queue_run(
     jmx = await jmx_crud.get_by_test_case_id(db, id)
     if jmx is None:
         raise MysteriousException(Codes.JMX_NOT_EXIST)
+    num_threads = param.num_threads if param.num_threads not in (None, "") else (testcase.num_threads or "10")
+    ramp_time = param.ramp_time if param.ramp_time not in (None, "") else (testcase.ramp_time or "0")
+    duration = param.duration if param.duration not in (None, "") else (testcase.duration or "60")
+    _validate_run_params(num_threads, ramp_time, duration, param.thread_group_overrides)
     if testcase.status == TestCaseStatus.RUN_ING.value:
         raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
     if await _is_init_artifact_testcase(db, id):
@@ -737,6 +785,17 @@ async def _run_testcase_now(
     jmx = await jmx_crud.get_by_test_case_id(db, id)
     if jmx is None:
         raise MysteriousException(Codes.JMX_NOT_EXIST)
+
+    # 压测参数优先使用传入值，否则回退到用例自身保存的值。
+    num_threads = param.num_threads if param.num_threads not in (None, "") else (testcase.num_threads or "10")
+    ramp_time = param.ramp_time if param.ramp_time not in (None, "") else (testcase.ramp_time or "0")
+    duration = param.duration if param.duration not in (None, "") else (testcase.duration or "60")
+    total_threads, _, _ = _validate_run_params(
+        num_threads,
+        ramp_time,
+        duration,
+        param.thread_group_overrides,
+    )
 
     if testcase.status == TestCaseStatus.RUN_ING.value:
         raise MysteriousException(Codes.TESTCASE_IS_RUNNING)
@@ -801,12 +860,6 @@ async def _run_testcase_now(
                 log.info("run 前置检查 slave %s 失败: %s", s.host, e)
                 raise MysteriousException(Codes.NODE_CANNOT_CONNECT) from e
         await _sync_case_dependencies_to_slaves(db, id, healthy_slaves)
-
-    # 压测参数优先使用传入值，否则回退到用例自身保存的值
-    num_threads = param.num_threads if param.num_threads not in (None, "") else (testcase.num_threads or "10")
-    ramp_time = param.ramp_time if param.ramp_time not in (None, "") else (testcase.ramp_time or "0")
-    duration = param.duration if param.duration not in (None, "") else (testcase.duration or "60")
-    total_threads = int(num_threads)
 
     # 分布式执行：总并发数按 slave 数均分，每台只执行自己的份额
     slave_count = len(healthy_slaves)

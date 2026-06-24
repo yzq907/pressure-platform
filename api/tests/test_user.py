@@ -419,14 +419,13 @@ async def test_auth_dep_with_valid_token(auth_client: AsyncClient, client: Async
 
 
 @pytest.mark.asyncio
-async def test_auth_dep_with_token_via_query_param(auth_client: AsyncClient, client: AsyncClient) -> None:
-    """复刻 Java TokenUtils 行为：header 没有时也接受 query param"""
+async def test_auth_dep_rejects_token_via_query_param(auth_client: AsyncClient, client: AsyncClient) -> None:
     await auth_client.post("/user/add", json={"username": "iris", "password": "Password123"})
     login_resp = await client.post("/user/login", json={"username": "iris", "password": "Password123"})
     token = login_resp.json()["data"]
 
     resp = await client.get(f"/_test/whoami?token={token}")
-    assert resp.json()["code"] == 0
+    assert resp.json()["code"] == 1007
 
 
 @pytest.mark.asyncio

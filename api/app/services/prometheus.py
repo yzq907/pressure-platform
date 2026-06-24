@@ -36,6 +36,10 @@ DEFAULT_PROMETHEUS_RESOURCE_METRICS = (
     "diskUtil",
     "gc",
 )
+DISK_PROMETHEUS_RESOURCE_METRICS = ("diskRead", "diskWrite", "diskUtil")
+RESOURCE_METRICS_CACHE_TTL_SECONDS = 45
+_RESOURCE_METRICS_CACHE_MAX_SIZE = 256
+_RESOURCE_METRICS_CACHE: dict[tuple, tuple[float, ResourceMetricsVO]] = {}
 
 def _to_epoch_ms(dt: datetime | None) -> int:
     if dt is None:
@@ -84,34 +88,57 @@ def _parse_resource_group_map(raw: str) -> dict[str, list[ResourceTargetVO]]:
         if not isinstance(raw_targets, list):
             continue
 
+        group_name = str(group_key).strip()
         targets: list[ResourceTargetVO] = []
-        for item in raw_targets:
-            if not isinstance(item, dict):
-                continue
-            instance = str(item.get("instance") or "").strip()
-            if not instance:
-                continue
-            service = str(item.get("service") or item.get("name") or group_key).strip()
-            name = str(item.get("name") or service or instance).strip()
-            role = str(item.get("role") or "相关服务").strip()
-            targets.append(
-                ResourceTargetVO(
-                    name=name,
-                    role=role,
-                    service=service,
-                    instance=instance,
+        for index, item in enumerate(raw_targets, start=1):
+            if isinstance(item, str):
+                instance = item.strip()
+                if not instance:
+                    continue
+                target_name = group_name if len(raw_targets) == 1 else f"{group_name}-{index}"
+                targets.append(
+                    ResourceTargetVO(
+                        name=target_name,
+                        role="相关服务",
+                        service=group_name,
+                        instance=instance,
+                    )
                 )
-            )
+                continue
+
+            if isinstance(item, dict):
+                instance = str(item.get("instance") or "").strip()
+                if not instance:
+                    continue
+                service = str(item.get("service") or item.get("name") or group_name).strip()
+                name = str(item.get("name") or service or instance).strip()
+                role = str(item.get("role") or "相关服务").strip()
+                targets.append(
+                    ResourceTargetVO(
+                        name=name,
+                        role=role,
+                        service=service,
+                        instance=instance,
+                    )
+                )
         if targets:
-            groups[str(group_key)] = targets
+            groups[group_name] = targets
     return groups
 
 def _quote_prom_label(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
-def _prometheus_resource_queries(instance: str, instance_label: str) -> dict[str, str]:
+def _prometheus_resource_queries(
+    instance: str,
+    instance_label: str,
+    *,
+    exclude_device_mapper: bool = True,
+) -> dict[str, str]:
     selector = f'{instance_label}="{_quote_prom_label(instance)}"'
-    disk_selector = f'{selector},device!~"^(dm-|loop|ram|fd|sr).*"'
+    disk_exclude_pattern = (
+        "^(dm-|loop|ram|fd|sr).*" if exclude_device_mapper else "^(loop|ram|fd|sr).*"
+    )
+    disk_selector = f'{selector},device!~"{disk_exclude_pattern}"'
     return {
         "cpu": (
             "100 - (avg(rate(node_cpu_seconds_total{"
@@ -324,6 +351,7 @@ async def get_resource_metrics(
     id: int,
     step: int | None = None,
     instance: str | None = None,
+    force_refresh: bool = False,
 ) -> ResourceMetricsVO:
     report = await crud.get_by_id(db, id)
     if report is None:
@@ -367,11 +395,33 @@ async def get_resource_metrics(
     from_ms, to_ms = await _resource_metric_time_range(db, report, from_offset, to_offset)
     start_sec = from_ms // 1000
     end_sec = _stable_prometheus_end_sec(start_sec, to_ms // 1000, step)
+    cache_key = (
+        id,
+        base_url.rstrip("/"),
+        resolved_instance,
+        instance_label or "instance",
+        start_sec,
+        to_ms // 1000,
+        step,
+    )
+    now = time.monotonic()
+    cached = _RESOURCE_METRICS_CACHE.get(cache_key)
+    if not force_refresh and cached is not None:
+        expires_at, cached_metrics = cached
+        if expires_at > now:
+            return cached_metrics
+        _RESOURCE_METRICS_CACHE.pop(cache_key, None)
 
     queries = _prometheus_resource_queries(resolved_instance, instance_label or "instance")
+    fallback_queries = _prometheus_resource_queries(
+        resolved_instance,
+        instance_label or "instance",
+        exclude_device_mapper=False,
+    )
     series: dict[str, list[dict]] = {}
     first_error: MysteriousException | None = None
     failed_count = 0
+    empty_disk_metrics: list[str] = []
     query_results = await asyncio.gather(
         *(
             _query_prometheus_range(base_url, queries[name], start_sec, end_sec, step, timeout)
@@ -390,10 +440,35 @@ async def get_resource_metrics(
         if isinstance(result, Exception):
             raise result
         series[name] = result
+        if name in DISK_PROMETHEUS_RESOURCE_METRICS and not result:
+            empty_disk_metrics.append(name)
     if first_error is not None and failed_count == len(DEFAULT_PROMETHEUS_RESOURCE_METRICS):
         raise first_error
+    if empty_disk_metrics:
+        fallback_results = await asyncio.gather(
+            *(
+                _query_prometheus_range(
+                    base_url,
+                    fallback_queries[name],
+                    start_sec,
+                    end_sec,
+                    step,
+                    timeout,
+                )
+                for name in empty_disk_metrics
+            ),
+            return_exceptions=True,
+        )
+        for name, result in zip(empty_disk_metrics, fallback_results, strict=True):
+            if isinstance(result, MysteriousException):
+                log.info("Prometheus 磁盘 fallback 查询失败: report_id=%s metric=%s", id, name)
+                continue
+            if isinstance(result, Exception):
+                raise result
+            if result:
+                series[name] = result
 
-    return ResourceMetricsVO(
+    metrics = ResourceMetricsVO(
         report_id=id,
         instance=resolved_instance,
         from_ms=from_ms,
@@ -401,3 +476,8 @@ async def get_resource_metrics(
         step=step,
         series=series,
     )
+    if len(_RESOURCE_METRICS_CACHE) >= _RESOURCE_METRICS_CACHE_MAX_SIZE:
+        oldest_key = min(_RESOURCE_METRICS_CACHE, key=lambda key: _RESOURCE_METRICS_CACHE[key][0])
+        _RESOURCE_METRICS_CACHE.pop(oldest_key, None)
+    _RESOURCE_METRICS_CACHE[cache_key] = (now + RESOURCE_METRICS_CACHE_TTL_SECONDS, metrics)
+    return metrics

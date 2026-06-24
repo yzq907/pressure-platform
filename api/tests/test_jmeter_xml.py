@@ -229,7 +229,43 @@ def test_update_run_thread_applies_named_thread_group_overrides(tmp_path: Path) 
     assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.duration") == ["600"]
     assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "TargetLevel") == ["100"]
     assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "RampUp") == ["60"]
-    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "Hold") == ["300"]
+    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "Hold") == ["600"]
+
+
+def test_update_run_thread_fixed_mode_keeps_pressure_but_uses_global_duration(tmp_path: Path) -> None:
+    jmx = _copy_sample(tmp_path)
+    dest = tmp_path / "run.jmx"
+
+    jmeter_xml.update_run_thread(
+        str(jmx),
+        str(dest),
+        "50",
+        "30",
+        "600",
+        [
+            {"key": "thread_group:0", "name": "Default ThreadGroup", "mode": "fixed"},
+            {"key": "stepping_thread_group:1", "name": "Disabled Stepping", "mode": "fixed", "enabled": True},
+            {"key": "concurrency_thread_group:2", "name": "Concurrency Group", "mode": "fixed"},
+        ],
+    )
+
+    tree = etree.parse(str(dest))
+    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.num_threads") == ["50"]
+    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.ramp_time") == ["10"]
+    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.scheduler") == ["true"]
+    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.duration") == ["600"]
+    assert _find_named_text(tree, "ThreadGroup", "LoopController.continue_forever") == ["true"]
+    assert _find_named_text(tree, "ThreadGroup", "LoopController.loops") == ["-1"]
+
+    stepping = next(tree.iter("kg.apc.jmeter.threads.SteppingThreadGroup"))
+    assert stepping.get("enabled") == "true"
+    assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "ThreadGroup.num_threads") == ["200"]
+    assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "Start users period") == ["30"]
+    assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "flighttime") == ["600"]
+
+    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "TargetLevel") == ["100"]
+    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "RampUp") == ["60"]
+    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "Hold") == ["600"]
 
 
 def test_list_thread_groups_returns_all_groups_with_key_and_enabled(tmp_path: Path) -> None:
