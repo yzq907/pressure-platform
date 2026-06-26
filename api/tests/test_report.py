@@ -185,6 +185,62 @@ async def test_report_get_by_id(auth_client: AsyncClient, db: AsyncSession) -> N
 
 
 @pytest.mark.asyncio
+async def test_report_error_samples_reads_artifact_and_groups_by_error_type(
+    auth_client: AsyncClient, db: AsyncSession, tmp_path
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "error_samples.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({
+                    "sampleTime": 1700000000000,
+                    "label": "登录接口",
+                    "threadName": "Thread Group 1-1",
+                    "responseCode": "403",
+                    "responseMessage": "Forbidden",
+                    "elapsed": 120,
+                    "failureMessage": "",
+                    "requestHeaders": "Authorization: Bearer abc\nCookie: sid=123",
+                    "responseHeaders": "HTTP/1.1 403 Forbidden",
+                    "responseBody": "{\"code\":403}",
+                    "truncated": False,
+                    "errorType": "403",
+                }),
+                json.dumps({
+                    "sampleTime": 1700000001000,
+                    "label": "查询接口",
+                    "threadName": "Thread Group 1-2",
+                    "responseCode": "504",
+                    "responseMessage": "Gateway Timeout",
+                    "elapsed": 3000,
+                    "failureMessage": "",
+                    "requestHeaders": "",
+                    "responseHeaders": "HTTP/1.1 504 Gateway Timeout",
+                    "responseBody": "timeout",
+                    "truncated": False,
+                    "errorType": "504",
+                }),
+                "not-json",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(db, name="error-samples", artifact_dir=str(artifact_dir))
+
+    resp = await auth_client.get(f"/report/errorSamples/{rid}")
+
+    assert resp.json()["code"] == 0
+    data = resp.json()["data"]
+    assert data["total"] == 2
+    assert data["groups"] == {"403": 1, "504": 1}
+    assert data["list"][0]["label"] == "查询接口"
+    assert data["list"][0]["errorType"] == "504"
+    assert "Bearer abc" not in data["list"][1]["requestHeaders"]
+    assert "******" in data["list"][1]["requestHeaders"]
+
+
+@pytest.mark.asyncio
 async def test_report_resource_metrics_queries_prometheus(
     auth_client: AsyncClient,
     db: AsyncSession,

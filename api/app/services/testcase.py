@@ -29,6 +29,17 @@ from app.core.enums import ExecType, NodeStatus, TestCaseStatus
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
 from app.core.ssh import SSHClient
+from app.core.jmeter_error_samples import (
+    DEFAULT_ERROR_SAMPLE_PER_CODE_LIMIT,
+    DEFAULT_ERROR_SAMPLE_TEXT_MAX_BYTES,
+    DEFAULT_ERROR_SAMPLE_TOTAL_LIMIT,
+    ERROR_SAMPLE_FILE_PROP,
+    ERROR_SAMPLE_FILENAME,
+    ERROR_SAMPLE_PER_CODE_LIMIT_PROP,
+    ERROR_SAMPLE_TEXT_MAX_BYTES_PROP,
+    ERROR_SAMPLE_TOTAL_LIMIT_PROP,
+    apply_error_sample_listener,
+)
 from app.crud import csv as csv_crud
 from app.crud import jar as jar_crud
 from app.crud import jmx as jmx_crud
@@ -909,8 +920,9 @@ async def _run_testcase_now(
     jtl_path = jtl_dir + testcase.name + ".jtl"
     log_path = log_dir + f"jmeter_{ts}.log"
     artifact_dir = str(Path(data_dir).resolve().parent / "artifacts")
-    if is_init_artifact:
-        Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+    Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+    error_sample_path = str(Path(artifact_dir) / ERROR_SAMPLE_FILENAME)
+    apply_error_sample_listener(run_jmx_path, run_jmx_path)
     if healthy_slaves:
         csvs = await csv_crud.get_by_test_case_id(db, id)
         await _prepare_split_csv_files(csvs, healthy_slaves, str(Path(data_dir).resolve().parent), run_jmx_path)
@@ -936,6 +948,12 @@ async def _run_testcase_now(
         cmd += ["-R", ",".join(remote_hosts)]
     if is_init_artifact:
         cmd.append(f"-JartifactDir={artifact_dir}")
+    cmd += [
+        f"-J{ERROR_SAMPLE_FILE_PROP}={error_sample_path}",
+        f"-J{ERROR_SAMPLE_PER_CODE_LIMIT_PROP}={DEFAULT_ERROR_SAMPLE_PER_CODE_LIMIT}",
+        f"-J{ERROR_SAMPLE_TOTAL_LIMIT_PROP}={DEFAULT_ERROR_SAMPLE_TOTAL_LIMIT}",
+        f"-J{ERROR_SAMPLE_TEXT_MAX_BYTES_PROP}={DEFAULT_ERROR_SAMPLE_TEXT_MAX_BYTES}",
+    ]
     cmd += [
         "-l",
         jtl_path,

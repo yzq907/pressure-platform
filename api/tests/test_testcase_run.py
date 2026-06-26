@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
+from lxml import etree
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -261,6 +262,13 @@ async def test_run_no_slaves_no_R_flag(
     resp = await auth_client.get(f"/testcase/run/{case_id}")
     assert resp.json()["code"] == 0
     assert "-R" not in captured["cmd"]
+    assert any(arg.startswith("-Jplatform.errorSampleFile=") for arg in captured["cmd"])
+    assert "-Jplatform.errorSamplePerCodeLimit=10" in captured["cmd"]
+    assert "-Jplatform.errorSampleTotalLimit=100" in captured["cmd"]
+    run_jmx = Path(captured["cmd"][captured["cmd"].index("-t") + 1])
+    tree = etree.parse(str(run_jmx))
+    listeners = tree.findall(".//JSR223Listener[@testname='平台错误请求采样']")
+    assert len(listeners) == 1
     await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import List
 
 from pydantic import field_serializer
 
@@ -184,6 +185,35 @@ class ArtifactVO(CamelModel):
     @field_serializer("modify_time", when_used="json")
     def _ser_modify_time(self, v: datetime | None) -> str | None:
         return _fmt_dt(v)
+
+
+class ErrorSampleVO(CamelModel):
+    """报告失败请求采样。"""
+
+    sample_time: int = 0
+    sample_time_text: str = ""
+    label: str = ""
+    thread_name: str = ""
+    response_code: str = ""
+    response_message: str = ""
+    elapsed: int = 0
+    failure_message: str = ""
+    request_url: str = ""
+    request_headers: str = ""
+    request_body: str = ""
+    response_headers: str = ""
+    response_body: str = ""
+    truncated: bool = False
+    error_type: str = ""
+
+
+class ErrorSamplesVO(CamelModel):
+    """报告失败请求采样列表。"""
+
+    report_id: int = 0
+    total: int = 0
+    groups: dict[str, int] = {}
+    list: List[ErrorSampleVO] = []
 
 
 class CompareVO(CamelModel):

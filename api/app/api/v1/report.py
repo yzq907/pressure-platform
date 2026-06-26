@@ -23,6 +23,7 @@ from app.deps.permission import require_any_permission, require_permission
 from app.schemas.report import (
     ArtifactVO,
     CompareVO,
+    ErrorSamplesVO,
     MetricsVO,
     ReportByTestCaseQuery,
     ReportQuery,
@@ -199,6 +200,22 @@ async def get_resource_metrics(
     db: AsyncSession = Depends(get_db),
 ) -> Response[ResourceMetricsVO]:
     items = await service.get_resource_metrics(db, id, step, instance, force_refresh)
+    return success(items)
+
+
+@router.get(
+    "/errorSamples/{id}",
+    summary="查看指定报告的失败请求采样",
+    response_model=Response[ErrorSamplesVO],
+    response_model_by_alias=True,
+)
+async def get_error_samples(
+    id: int,
+    limit: int = 100,
+    current: UserContext = Depends(require_any_permission(PERMISSION_REPORT, PERMISSION_EXECUTION)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[ErrorSamplesVO]:
+    items = await service.get_error_samples(db, id, limit)
     return success(items)
 
 

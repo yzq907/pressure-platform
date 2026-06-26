@@ -61,6 +61,7 @@ from app.services.report_metrics import (
     get_jtl_metrics,
     schedule_metric_snapshot_generation,
 )
+from app.services.report_error_samples import get_error_samples
 from app.services.report_transactions import (
     generate_transaction_metric_snapshots_for_report,
     generate_transaction_snapshots_for_report,
