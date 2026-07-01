@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import ExecType, TestCaseStatus
+from app.core.exceptions import MysteriousException
 from app.models.config import Config
 from app.models.execution_node import ExecutionNode
 from app.models.execution_run import ExecutionRun
@@ -185,12 +186,30 @@ async def test_report_get_by_id(auth_client: AsyncClient, db: AsyncSession) -> N
 
 
 @pytest.mark.asyncio
-async def test_report_error_samples_reads_artifact_and_groups_by_error_type(
+async def test_report_artifacts_hide_internal_error_sample_files(db: AsyncSession, tmp_path) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "report.zip").write_text("public", encoding="utf-8")
+    (artifact_dir / "error_samples.xml").write_text("<testResults/>", encoding="utf-8")
+    (artifact_dir / "error_samples.10.10.27.97.jsonl").write_text("", encoding="utf-8")
+    rid = await _insert_report(db, name="artifact-filter", artifact_dir=str(artifact_dir))
+
+    items = await report_service.list_artifacts(db, rid)
+
+    assert [item.name for item in items] == ["report.zip"]
+    with pytest.raises(MysteriousException):
+        await report_service.download_artifact(db, rid, "error_samples.xml")
+
+
+@pytest.mark.asyncio
+async def test_report_error_samples_reads_internal_jsonl_and_groups_by_error_type(
     auth_client: AsyncClient, db: AsyncSession, tmp_path
 ) -> None:
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
-    (artifact_dir / "error_samples.jsonl").write_text(
+    error_dir = tmp_path / "_internal" / "error_samples"
+    error_dir.mkdir(parents=True)
+    (error_dir / "error_samples.jsonl").write_text(
         "\n".join(
             [
                 json.dumps({
@@ -238,6 +257,168 @@ async def test_report_error_samples_reads_artifact_and_groups_by_error_type(
     assert data["list"][0]["errorType"] == "504"
     assert "Bearer abc" not in data["list"][1]["requestHeaders"]
     assert "******" in data["list"][1]["requestHeaders"]
+
+
+@pytest.mark.asyncio
+async def test_report_error_samples_ignores_legacy_artifact_jsonl(
+    auth_client: AsyncClient, db: AsyncSession, tmp_path
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    (artifact_dir / "error_samples.jsonl").write_text(
+        json.dumps(
+            {
+                "sampleTime": 1700000000000,
+                "label": "旧位置错误",
+                "responseCode": "500",
+                "errorType": "500",
+            }
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(db, name="ignore-legacy-error-samples", artifact_dir=str(artifact_dir))
+
+    resp = await auth_client.get(f"/report/errorSamples/{rid}")
+
+    data = resp.json()["data"]
+    assert data["total"] == 0
+    assert data["groups"] == {}
+    assert data["list"] == []
+
+
+@pytest.mark.asyncio
+async def test_report_error_samples_reads_internal_error_sample_dir(
+    auth_client: AsyncClient, db: AsyncSession, tmp_path
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    error_dir = tmp_path / "_internal" / "error_samples"
+    error_dir.mkdir(parents=True)
+    (error_dir / "error_samples.jsonl").write_text(
+        json.dumps(
+            {
+                "sampleTime": 1700000000000,
+                "label": "内部错误",
+                "threadName": "Thread Group 1-1",
+                "responseCode": "500",
+                "responseMessage": "Internal Error",
+                "elapsed": 100,
+                "responseBody": "failed",
+                "errorType": "500",
+            }
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(db, name="internal-error-samples", artifact_dir=str(artifact_dir))
+
+    resp = await auth_client.get(f"/report/errorSamples/{rid}")
+
+    data = resp.json()["data"]
+    assert data["total"] == 1
+    assert data["groups"] == {"500": 1}
+    assert data["list"][0]["label"] == "内部错误"
+
+
+@pytest.mark.asyncio
+async def test_report_error_samples_backfills_missing_error_types_from_jtl(
+    auth_client: AsyncClient, db: AsyncSession, tmp_path
+) -> None:
+    report_root = tmp_path / "report" / "2026-06-26-13:39:25"
+    artifact_dir = report_root / "artifacts"
+    error_dir = report_root / "_internal" / "error_samples"
+    jtl_dir = report_root / "jtl"
+    artifact_dir.mkdir(parents=True)
+    error_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (error_dir / "error_samples.jsonl").write_text(
+        json.dumps({
+            "sampleTime": 1700000000000,
+            "label": "4_资源上传",
+            "responseCode": "403",
+            "failureMessage": "Test failed",
+            "errorType": "403",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    (jtl_dir / "sample.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect",
+                "1700000001000,20,5_资源下载,404,,tg 1-1,text,false,The result was the wrong size,842,100,1,1,https://example.test/download,20,0,1",
+                "1700000002000,30,6_获取设备信息,200,,tg 1-2,text,false,\"Test failed: text expected to contain /\"\"status\"\":2000/\",99,100,1,1,https://example.test/device,30,0,1",
+                "1700000003000,10,7_正常接口,200,,tg 1-3,text,true,,99,100,1,1,https://example.test/ok,10,0,1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="error-samples-jtl-backfill",
+        report_dir=str(report_root / "data") + os.sep,
+        artifact_dir=str(artifact_dir),
+    )
+
+    resp = await auth_client.get(f"/report/errorSamples/{rid}")
+
+    assert resp.json()["code"] == 0
+    data = resp.json()["data"]
+    assert data["total"] == 3
+    assert data["groups"] == {"403": 1, "404": 1, "ASSERTION_FAILED": 1}
+    labels = {item["label"]: item for item in data["list"]}
+    assert labels["5_资源下载"]["errorType"] == "404"
+    assert labels["5_资源下载"]["requestUrl"] == "https://example.test/download"
+    assert labels["6_获取设备信息"]["errorType"] == "ASSERTION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_report_error_samples_reads_error_xml_details(
+    auth_client: AsyncClient, db: AsyncSession, tmp_path
+) -> None:
+    report_root = tmp_path / "report" / "2026-06-26-13:39:25"
+    artifact_dir = report_root / "artifacts"
+    error_dir = report_root / "_internal" / "error_samples"
+    artifact_dir.mkdir(parents=True)
+    error_dir.mkdir(parents=True)
+    (error_dir / "error_samples.xml").write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<testResults version="1.2">
+<httpSample t="120" it="0" lt="100" ct="10" ts="1700000004000" s="false" lb="登录接口" rc="403" rm="Forbidden" tn="tg 1-1" dt="text" by="99" sby="88" ng="1" na="1">
+  <assertionResult>
+    <name>业务断言</name>
+    <failure>true</failure>
+    <error>false</error>
+    <failureMessage>登录失败</failureMessage>
+  </assertionResult>
+  <responseData class="java.lang.String">{&quot;status&quot;:6015}</responseData>
+  <samplerData>GET https://example.test/login</samplerData>
+  <requestHeader>Authorization: Bearer abc
+Cookie: sid=123</requestHeader>
+  <responseHeader>HTTP/1.1 403 Forbidden</responseHeader>
+  <java.net.URL>https://example.test/login</java.net.URL>
+</httpSample>
+</testResults>
+""",
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="error-samples-xml",
+        report_dir=str(report_root / "data") + os.sep,
+        artifact_dir=str(artifact_dir),
+    )
+
+    resp = await auth_client.get(f"/report/errorSamples/{rid}")
+
+    assert resp.json()["code"] == 0
+    item = resp.json()["data"]["list"][0]
+    assert item["label"] == "登录接口"
+    assert item["errorType"] == "403"
+    assert item["requestUrl"] == "https://example.test/login"
+    assert "Bearer abc" not in item["requestHeaders"]
+    assert "******" in item["requestHeaders"]
+    assert item["responseHeaders"] == "HTTP/1.1 403 Forbidden"
+    assert item["responseBody"] == '{"status":6015}'
 
 
 @pytest.mark.asyncio

@@ -266,7 +266,11 @@ def mock_ssh(request, monkeypatch) -> Any:
     async def fake_scp(self, local_path: str, remote_dir: str, *, raise_on_error: bool = False) -> None:
         return None
 
+    async def fake_fetch(self, remote_path: str, local_path: str, *, raise_on_error: bool = False) -> None:
+        return None
+
     monkeypatch.setattr(ssh_mod.SSHClient, "telnet", fake_telnet)
     monkeypatch.setattr(ssh_mod.SSHClient, "exec_command", fake_exec)
     monkeypatch.setattr(ssh_mod.SSHClient, "scp_file", fake_scp)
+    monkeypatch.setattr(ssh_mod.SSHClient, "fetch_file", fake_fetch)
     return None

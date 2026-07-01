@@ -151,13 +151,14 @@ CREATE TABLE `mysterious_jar` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 COMMENT='JAR包表';
 
-CREATE TABLE `mysterious_csv` (
+CREATE TABLE `mysterious_csv_resource` (
     `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
-    `src_name` varchar(255) NOT NULL DEFAULT '' COMMENT '上传前CSV文件名称',
-    `dst_name` varchar(255) NOT NULL DEFAULT '' COMMENT '上传后CSV文件名称',
-    `description` varchar(255) NOT NULL DEFAULT '' COMMENT 'CSV文件描述',
-    `csv_dir` varchar(255) NOT NULL DEFAULT '' COMMENT 'csv文件目录',
-    `test_case_id` bigint(20) NOT NULL DEFAULT '0' COMMENT '用例ID',
+    `filename` varchar(255) NOT NULL DEFAULT '' COMMENT '公共文件名称',
+    `file_dir` varchar(255) NOT NULL DEFAULT '' COMMENT '公共文件目录',
+    `file_type` varchar(32) NOT NULL DEFAULT '' COMMENT '文件类型：csv/upload_file',
+    `description` varchar(255) NOT NULL DEFAULT '' COMMENT '文件描述',
+    `file_size` bigint NOT NULL DEFAULT '0' COMMENT '文件大小',
+    `checksum` varchar(64) NOT NULL DEFAULT '' COMMENT '文件SHA256',
     `creator_id` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人ID',
     `creator` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人',
     `modifier_id` varchar(32) NOT NULL DEFAULT '' COMMENT '修改人ID',
@@ -165,9 +166,44 @@ CREATE TABLE `mysterious_csv` (
     `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '生成时间',
     `modify_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (`id`),
-    KEY `idx_test_case_id` (`test_case_id`) USING BTREE
+    UNIQUE KEY `uk_mysterious_csv_resource_filename` (`filename`) USING BTREE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-COMMENT='CSV文件表';
+COMMENT='公共参数化和上传文件资源表';
+
+CREATE TABLE `mysterious_testcase_csv_binding` (
+    `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `test_case_id` bigint NOT NULL DEFAULT '0' COMMENT '用例ID',
+    `filename` varchar(255) NOT NULL DEFAULT '' COMMENT '公共CSV文件名称',
+    `description` varchar(255) NOT NULL DEFAULT '' COMMENT '绑定描述',
+    `distribution_strategy` varchar(32) NOT NULL DEFAULT 'shared' COMMENT '分布式参数文件读取策略',
+    `creator_id` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人ID',
+    `creator` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人',
+    `modifier_id` varchar(32) NOT NULL DEFAULT '' COMMENT '修改人ID',
+    `modifier` varchar(32) NOT NULL DEFAULT '' COMMENT '修改人',
+    `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '生成时间',
+    `modify_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_testcase_csv_binding_case_filename` (`test_case_id`, `filename`) USING BTREE,
+    KEY `idx_testcase_csv_binding_filename` (`filename`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+COMMENT='用例与公共CSV参数化文件绑定表';
+
+CREATE TABLE `mysterious_testcase_upload_file_binding` (
+    `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `test_case_id` bigint NOT NULL DEFAULT '0' COMMENT '用例ID',
+    `filename` varchar(255) NOT NULL DEFAULT '' COMMENT '公共上传文件名称',
+    `description` varchar(255) NOT NULL DEFAULT '' COMMENT '绑定描述',
+    `creator_id` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人ID',
+    `creator` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人',
+    `modifier_id` varchar(32) NOT NULL DEFAULT '' COMMENT '修改人ID',
+    `modifier` varchar(32) NOT NULL DEFAULT '' COMMENT '修改人',
+    `create_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '生成时间',
+    `modify_time` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_testcase_upload_file_binding_case_filename` (`test_case_id`, `filename`) USING BTREE,
+    KEY `idx_testcase_upload_file_binding_filename` (`filename`) USING BTREE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+COMMENT='用例与公共上传文件绑定表';
 
 CREATE TABLE `mysterious_report` (
     `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',

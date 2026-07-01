@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shlex
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,27 +36,28 @@ from app.core.jmeter_error_samples import (
     DEFAULT_ERROR_SAMPLE_TOTAL_LIMIT,
     ERROR_SAMPLE_FILE_PROP,
     ERROR_SAMPLE_FILENAME,
+    ERROR_SAMPLE_XML_FILENAME,
     ERROR_SAMPLE_PER_CODE_LIMIT_PROP,
     ERROR_SAMPLE_TEXT_MAX_BYTES_PROP,
     ERROR_SAMPLE_TOTAL_LIMIT_PROP,
     apply_error_sample_listener,
+    apply_error_result_collector,
+    error_sample_dir_from_artifact_dir,
 )
-from app.crud import csv as csv_crud
+from app.crud import csv_resource as csv_resource_crud
 from app.crud import jar as jar_crud
 from app.crud import jmx as jmx_crud
 from app.crud import node as node_crud
 from app.crud import report as report_crud
 from app.crud import testcase as crud
-from app.crud import upload_file as upload_file_crud
-from app.models.csv import Csv
+from app.crud import testcase_csv_binding as csv_binding_crud
+from app.crud import testcase_upload_file_binding as upload_file_binding_crud
 from app.models.jar import Jar
 from app.models.jmx import Jmx
 from app.models.report import Report as ReportModel
 from app.models.testcase import TestCase
-from app.schemas.csv import CsvVO
 from app.schemas.jar import JarVO
 from app.schemas.jmx import JmxVO
-from app.schemas.upload_file import UploadFileVO
 from app.schemas.report import ReportParam
 from app.schemas.testcase import (
     JMeterResultVO,
@@ -70,6 +72,7 @@ from app.services import config as config_service
 from app.services import csv as csv_service
 from app.services import execution_node as execution_node_service
 from app.services import jmeter_runner
+from app.services import upload_file as upload_file_service
 from app.services import report as report_service
 from app.core.jmeter_xml import (
     apply_thread_group_pacing,
@@ -105,6 +108,29 @@ _BAD_NAME_CHARS = re.compile(r"[\s#]")
 _JMETER_RESULT_RE = re.compile(
     r"\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}),\d{3} INFO.*summary \+.* (\d+\.\d+)/s Avg: +(\d+)"
 )
+
+
+@dataclass(slots=True)
+class RuntimeCsvRef:
+    src_name: str
+    dst_name: str
+    csv_dir: str
+    distribution_strategy: str
+
+    @property
+    def local_path(self) -> str:
+        return str(Path(self.csv_dir) / self.dst_name)
+
+
+@dataclass(slots=True)
+class RuntimeUploadFileRef:
+    src_name: str
+    dst_name: str
+    file_dir: str
+
+    @property
+    def local_path(self) -> str:
+        return str(Path(self.file_dir) / self.dst_name)
 
 
 def _check_name(name: str | None) -> None:
@@ -184,27 +210,17 @@ async def update_testcase(
 async def _cascade_description_on_rename(
     db: AsyncSession, testcase_id: int, new_name: str, user: UserContext
 ) -> None:
-    """用例改名 → 同步 JMX/CSV/JAR/上传文件的 description = 新名字"""
+    """用例改名 → 同步 JMX/JAR 的 description = 新名字。"""
     jmx = await jmx_crud.get_by_test_case_id(db, testcase_id)
     if jmx is not None:
         jmx.description = new_name
         stamp_modify(jmx, user)
         await jmx_crud.update(db, jmx)
 
-    for csv_obj in await csv_crud.get_by_test_case_id(db, testcase_id):
-        csv_obj.description = new_name
-        stamp_modify(csv_obj, user)
-        await csv_crud.update(db, csv_obj)
-
     for jar_obj in await jar_crud.get_by_test_case_id(db, testcase_id):
         jar_obj.description = new_name
         stamp_modify(jar_obj, user)
         await jar_crud.update(db, jar_obj)
-
-    for upload_obj in await upload_file_crud.get_by_test_case_id(db, testcase_id):
-        upload_obj.description = new_name
-        stamp_modify(upload_obj, user)
-        await upload_file_crud.update(db, upload_obj)
 
 
 async def delete_testcase(db: AsyncSession, id: int) -> bool:
@@ -280,10 +296,6 @@ async def get_testcase_stats(db: AsyncSession, query: TestCaseQuery) -> TestCase
 async def get_associated_jmx(db: AsyncSession, testcase_id: int) -> Jmx | None:
     """供 csv/jar service 等模块判断用例是否已关联 JMX"""
     return await jmx_crud.get_by_test_case_id(db, testcase_id)
-
-
-async def get_associated_csvs(db: AsyncSession, testcase_id: int) -> list[Csv]:
-    return await csv_crud.get_by_test_case_id(db, testcase_id)
 
 
 async def get_associated_jars(db: AsyncSession, testcase_id: int) -> list[Jar]:
@@ -390,6 +402,116 @@ async def _is_init_artifact_testcase(db: AsyncSession, testcase_id: int) -> bool
     return testcase_id in _parse_id_set(raw)
 
 
+async def _runtime_csv_refs(db: AsyncSession, testcase_id: int) -> list[RuntimeCsvRef]:
+    refs: list[RuntimeCsvRef] = []
+    bindings = await csv_binding_crud.get_by_test_case_id(db, testcase_id)
+    for binding in bindings:
+        resource = await csv_resource_crud.get_by_filename(db, binding.filename)
+        if resource is None:
+            raise MysteriousException(
+                Codes.FILE_NOT_EXIST,
+                message=f"公共参数化文件不存在: {binding.filename}，请先在数据管理上传",
+            )
+        path = Path(resource.file_dir) / resource.filename
+        if not path.exists():
+            raise MysteriousException(
+                Codes.FILE_NOT_EXIST,
+                message=f"公共参数化文件不存在: {binding.filename}，请先在数据管理上传",
+            )
+        refs.append(
+            RuntimeCsvRef(
+                src_name=binding.filename,
+                dst_name=resource.filename,
+                csv_dir=resource.file_dir,
+                distribution_strategy=binding.distribution_strategy,
+            )
+        )
+    return refs
+
+
+async def _runtime_upload_file_refs(db: AsyncSession, testcase_id: int) -> list[RuntimeUploadFileRef]:
+    refs: list[RuntimeUploadFileRef] = []
+    bindings = await upload_file_binding_crud.get_by_test_case_id(db, testcase_id)
+    for binding in bindings:
+        resource = await csv_resource_crud.get_by_filename(db, binding.filename)
+        if resource is None:
+            raise MysteriousException(
+                Codes.FILE_NOT_EXIST,
+                message=f"公共上传文件不存在: {binding.filename}，请先在数据管理上传",
+            )
+        path = Path(resource.file_dir) / resource.filename
+        if not path.exists():
+            raise MysteriousException(
+                Codes.FILE_NOT_EXIST,
+                message=f"公共上传文件不存在: {binding.filename}，请先在数据管理上传",
+            )
+        refs.append(
+            RuntimeUploadFileRef(
+                src_name=binding.filename,
+                dst_name=resource.filename,
+                file_dir=resource.file_dir,
+            )
+        )
+    return refs
+
+
+async def _runtime_csv_refs_for_sync_node(db: AsyncSession, testcase_id: int) -> list[RuntimeCsvRef]:
+    refs: list[RuntimeCsvRef] = []
+    bindings = await csv_binding_crud.get_by_test_case_id(db, testcase_id)
+    for binding in bindings:
+        resource = await csv_resource_crud.get_by_filename(db, binding.filename)
+        path = Path(resource.file_dir) / resource.filename if resource is not None else None
+        if resource is None or path is None or not path.exists():
+            log.warning("syncNode 跳过缺失公共参数化文件: testcase_id=%s filename=%s", testcase_id, binding.filename)
+            continue
+        refs.append(
+            RuntimeCsvRef(
+                src_name=binding.filename,
+                dst_name=resource.filename,
+                csv_dir=resource.file_dir,
+                distribution_strategy=binding.distribution_strategy,
+            )
+        )
+    return refs
+
+
+async def _runtime_upload_file_refs_for_sync_node(db: AsyncSession, testcase_id: int) -> list[RuntimeUploadFileRef]:
+    refs: list[RuntimeUploadFileRef] = []
+    bindings = await upload_file_binding_crud.get_by_test_case_id(db, testcase_id)
+    for binding in bindings:
+        resource = await csv_resource_crud.get_by_filename(db, binding.filename)
+        path = Path(resource.file_dir) / resource.filename if resource is not None else None
+        if resource is None or path is None or not path.exists():
+            log.warning("syncNode 跳过缺失公共上传文件: testcase_id=%s filename=%s", testcase_id, binding.filename)
+            continue
+        refs.append(
+            RuntimeUploadFileRef(
+                src_name=binding.filename,
+                dst_name=resource.filename,
+                file_dir=resource.file_dir,
+            )
+        )
+    return refs
+
+
+async def _apply_runtime_file_refs(
+    db: AsyncSession,
+    testcase_id: int,
+    jmx_path: str,
+) -> tuple[list[RuntimeCsvRef], list[RuntimeUploadFileRef]]:
+    csvs = await _runtime_csv_refs(db, testcase_id)
+    upload_files = await _runtime_upload_file_refs(db, testcase_id)
+    update_upload_file_paths(
+        jmx_path,
+        {item.src_name: item.local_path for item in upload_files},
+    )
+    update_csv_filenames(
+        jmx_path,
+        {item.src_name: item.local_path for item in csvs},
+    )
+    return csvs, upload_files
+
+
 async def _sync_case_dependencies_to_slaves(
     db: AsyncSession,
     testcase_id: int,
@@ -398,9 +520,9 @@ async def _sync_case_dependencies_to_slaves(
     """执行前把当前用例依赖文件补同步到本次选中的 slave。"""
     if not slaves:
         return
-    csvs = await csv_crud.get_by_test_case_id(db, testcase_id)
+    csvs = await _runtime_csv_refs(db, testcase_id)
     jars = await jar_crud.get_by_test_case_id(db, testcase_id)
-    upload_files = await upload_file_crud.get_by_test_case_id(db, testcase_id)
+    upload_files = await _runtime_upload_file_refs(db, testcase_id)
     if not csvs and not jars and not upload_files:
         return
 
@@ -409,7 +531,7 @@ async def _sync_case_dependencies_to_slaves(
         for csv_obj in csvs:
             if csv_obj.distribution_strategy == csv_service.CSV_DISTRIBUTION_SPLIT_BY_SLAVE:
                 continue
-            local_path = csv_obj.csv_dir + csv_obj.dst_name
+            local_path = csv_obj.local_path
             try:
                 await ssh.scp_file(local_path, csv_obj.csv_dir, raise_on_error=True)
             except MysteriousException as e:
@@ -429,7 +551,7 @@ async def _sync_case_dependencies_to_slaves(
                     message=f"压力机「{slave.host}」同步JAR文件失败: {jar_obj.src_name}",
                 ) from e
         for upload_obj in upload_files:
-            local_path = upload_obj.file_dir + upload_obj.dst_name
+            local_path = upload_obj.local_path
             try:
                 await ssh.scp_file(local_path, upload_obj.file_dir, raise_on_error=True)
             except MysteriousException as e:
@@ -441,7 +563,7 @@ async def _sync_case_dependencies_to_slaves(
 
 
 async def _prepare_split_csv_files(
-    csvs: list[Csv],
+    csvs: list[RuntimeCsvRef],
     slaves: list,
     report_root: str,
     run_jmx_path: str,
@@ -648,6 +770,7 @@ async def debug_testcase(db: AsyncSession, id: int, user: UserContext) -> bool:
 
     # 调试用 debug 副本（线程数已改 1）
     debug_jmx_path = jmx.jmx_dir + "debug_" + jmx.dst_name
+    await _apply_runtime_file_refs(db, id, debug_jmx_path)
 
     ts = _ts_now()
     jtl_dir, log_dir, _data_dir = _prepare_report_dirs(testcase.test_case_dir, ts)
@@ -900,11 +1023,7 @@ async def _run_testcase_now(
         duration,
         thread_group_overrides,
     )
-    upload_files = await upload_file_crud.get_by_test_case_id(db, id)
-    update_upload_file_paths(
-        run_jmx_path,
-        {item.src_name: item.file_dir + item.dst_name for item in upload_files},
-    )
+    runtime_csvs, upload_files = await _apply_runtime_file_refs(db, id, run_jmx_path)
     actual_slave_count = max(1, slave_count)
     apply_thread_group_pacing(run_jmx_path, run_jmx_path, thread_group_overrides)
     actual_per_slave_threads = sum_enabled_thread_group_threads(run_jmx_path)
@@ -921,11 +1040,14 @@ async def _run_testcase_now(
     log_path = log_dir + f"jmeter_{ts}.log"
     artifact_dir = str(Path(data_dir).resolve().parent / "artifacts")
     Path(artifact_dir).mkdir(parents=True, exist_ok=True)
-    error_sample_path = str(Path(artifact_dir) / ERROR_SAMPLE_FILENAME)
+    error_sample_dir = error_sample_dir_from_artifact_dir(artifact_dir)
+    error_sample_dir.mkdir(parents=True, exist_ok=True)
+    error_sample_path = str(error_sample_dir / ERROR_SAMPLE_FILENAME)
+    error_sample_xml_path = str(error_sample_dir / ERROR_SAMPLE_XML_FILENAME)
     apply_error_sample_listener(run_jmx_path, run_jmx_path)
+    apply_error_result_collector(run_jmx_path, run_jmx_path, error_sample_xml_path)
     if healthy_slaves:
-        csvs = await csv_crud.get_by_test_case_id(db, id)
-        await _prepare_split_csv_files(csvs, healthy_slaves, str(Path(data_dir).resolve().parent), run_jmx_path)
+        await _prepare_split_csv_files(runtime_csvs, healthy_slaves, str(Path(data_dir).resolve().parent), run_jmx_path)
     remote_hosts = [
         s.host if legacy_ignore_health else f"{s.host}:1099"
         for s in healthy_slaves
@@ -953,7 +1075,16 @@ async def _run_testcase_now(
         f"-J{ERROR_SAMPLE_PER_CODE_LIMIT_PROP}={DEFAULT_ERROR_SAMPLE_PER_CODE_LIMIT}",
         f"-J{ERROR_SAMPLE_TOTAL_LIMIT_PROP}={DEFAULT_ERROR_SAMPLE_TOTAL_LIMIT}",
         f"-J{ERROR_SAMPLE_TEXT_MAX_BYTES_PROP}={DEFAULT_ERROR_SAMPLE_TEXT_MAX_BYTES}",
+        "-Jsample_sender_strip_also_on_error=false",
     ]
+    if healthy_slaves:
+        cmd += [
+            f"-G{ERROR_SAMPLE_FILE_PROP}={error_sample_path}",
+            f"-G{ERROR_SAMPLE_PER_CODE_LIMIT_PROP}={DEFAULT_ERROR_SAMPLE_PER_CODE_LIMIT}",
+            f"-G{ERROR_SAMPLE_TOTAL_LIMIT_PROP}={DEFAULT_ERROR_SAMPLE_TOTAL_LIMIT}",
+            f"-G{ERROR_SAMPLE_TEXT_MAX_BYTES_PROP}={DEFAULT_ERROR_SAMPLE_TEXT_MAX_BYTES}",
+            "-Gsample_sender_strip_also_on_error=false",
+        ]
     cmd += [
         "-l",
         jtl_path,
@@ -1319,15 +1450,13 @@ async def get_full_vo(db: AsyncSession, id: int) -> TestCaseFullVO | None:
     if testcase is None:
         return None
     jmx = await jmx_crud.get_by_test_case_id(db, id)
-    csvs = await csv_crud.get_by_test_case_id(db, id)
     jars = await jar_crud.get_by_test_case_id(db, id)
-    upload_files = await upload_file_crud.get_by_test_case_id(db, id)
     return TestCaseFullVO(
         **TestCaseVO.model_validate(testcase).model_dump(by_alias=False),
         jmx_vo=JmxVO.model_validate(jmx) if jmx else None,
-        csv_vo_list=[CsvVO.model_validate(o) for o in csvs],
+        csv_binding_vo_list=await csv_service.get_bindings_by_test_case_id(db, id),
         jar_vo_list=[JarVO.model_validate(o) for o in jars],
-        upload_file_vo_list=[UploadFileVO.model_validate(o) for o in upload_files],
+        upload_file_binding_vo_list=await upload_file_service.get_bindings_by_test_case_id(db, id),
     )
 
 
@@ -1344,12 +1473,14 @@ async def sync_node(db: AsyncSession, node_id: int, user: UserContext) -> bool:
     all_cases = list((await db.execute(stmt)).scalars().all())
     files: list[tuple[str, str, str, str]] = []
     for tc in all_cases:
-        for csv_obj in await csv_crud.get_by_test_case_id(db, tc.id):
-            files.append(("CSV", csv_obj.src_name, csv_obj.csv_dir + csv_obj.dst_name, csv_obj.csv_dir))
+        for csv_obj in await _runtime_csv_refs_for_sync_node(db, tc.id):
+            if csv_obj.distribution_strategy == csv_service.CSV_DISTRIBUTION_SPLIT_BY_SLAVE:
+                continue
+            files.append(("CSV", csv_obj.src_name, csv_obj.local_path, csv_obj.csv_dir))
         for jar_obj in await jar_crud.get_by_test_case_id(db, tc.id):
             files.append(("JAR", jar_obj.src_name, jar_obj.jar_dir + jar_obj.dst_name, jar_obj.jar_dir))
-        for upload_obj in await upload_file_crud.get_by_test_case_id(db, tc.id):
-            files.append(("上传文件", upload_obj.src_name, upload_obj.file_dir + upload_obj.dst_name, upload_obj.file_dir))
+        for upload_obj in await _runtime_upload_file_refs_for_sync_node(db, tc.id):
+            files.append(("上传文件", upload_obj.src_name, upload_obj.local_path, upload_obj.file_dir))
     log.info("syncNode node=%s host=%s files=%d", node_id, node.host, len(files))
     await _sync_dependency_files_to_slave(node, files)
     return True

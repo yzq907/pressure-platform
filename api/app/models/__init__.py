@@ -3,7 +3,7 @@
 from app.models.audit_log import AuditLog
 from app.models.ai_generation import AiGenerationArtifact, AiGenerationTask
 from app.models.config import Config
-from app.models.csv import Csv
+from app.models.csv_resource import CsvResource
 from app.models.execution_node import ExecutionNode
 from app.models.execution_queue import ExecutionQueue
 from app.models.execution_run import ExecutionRun
@@ -27,7 +27,8 @@ from app.models.role import Role, RolePermission
 from app.models.scheduled_task import ScheduledTask
 from app.models.scheduled_task_log import ScheduledTaskLog
 from app.models.testcase import TestCase
-from app.models.upload_file import UploadFileResource
+from app.models.testcase_csv_binding import TestcaseCsvBinding
+from app.models.testcase_upload_file_binding import TestcaseUploadFileBinding
 from app.models.user import User
 from app.models.user_session import UserSession
 
@@ -36,7 +37,7 @@ __all__ = [
     "AiGenerationArtifact",
     "AiGenerationTask",
     "Config",
-    "Csv",
+    "CsvResource",
     "ExecutionNode",
     "ExecutionQueue",
     "ExecutionRun",
@@ -61,7 +62,8 @@ __all__ = [
     "ScheduledTask",
     "ScheduledTaskLog",
     "TestCase",
-    "UploadFileResource",
+    "TestcaseCsvBinding",
+    "TestcaseUploadFileBinding",
     "User",
     "UserSession",
 ]

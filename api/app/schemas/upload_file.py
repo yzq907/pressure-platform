@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from app.schemas.base import BaseQuery, BaseVO
+from app.schemas.base import BaseVO, CamelModel
 
 
-class UploadFileVO(BaseVO):
-    src_name: str = ""
-    dst_name: str = ""
-    description: str = ""
-    file_dir: str = ""
+class UploadFileBindingParam(CamelModel):
+    test_case_id: int
+    filename: str
+    description: str | None = None
+
+
+class UploadFileBindingVO(BaseVO):
     test_case_id: int = 0
-
-
-class UploadFileQuery(BaseQuery):
-    src_name: str | None = None
-    test_case_id: int | None = None
+    filename: str = ""
+    description: str = ""
+    exists: bool = False

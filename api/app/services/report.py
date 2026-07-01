@@ -22,6 +22,7 @@ from app.core.codes import Codes
 from app.core.context import UserContext
 from app.core.enums import ExecType
 from app.core.exceptions import MysteriousException
+from app.core.jmeter_error_samples import is_error_sample_artifact_name
 from app.core.response import PageVO
 from app.crud import report as crud
 from app.models.report import Report
@@ -406,6 +407,8 @@ def _report_artifact_dir(report: Report) -> str | None:
 def _safe_artifact_path(artifact_dir: str | None, name: str) -> str:
     if not name or Path(name).name != name:
         raise MysteriousException(Codes.PARAM_WRONG, message="产物文件名不合法")
+    if is_error_sample_artifact_name(name):
+        raise MysteriousException(Codes.FILE_NOT_EXIST)
 
     if not artifact_dir:
         raise MysteriousException(Codes.REPORT_DIR_NOT_EXIST)
@@ -429,6 +432,8 @@ async def list_artifacts(db: AsyncSession, id: int) -> list[ArtifactVO]:
     items: list[ArtifactVO] = []
     for path in sorted(Path(artifact_dir).iterdir(), key=lambda p: p.name):
         if not path.is_file():
+            continue
+        if is_error_sample_artifact_name(path.name):
             continue
         stat = path.stat()
         items.append(

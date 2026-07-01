@@ -46,6 +46,10 @@ class SSHClient:
         """SCP 文件到远端目录（先 mkdir -p）。失败仅日志，不抛（对齐 Java）。"""
         await asyncio.to_thread(self._scp_sync, local_path, remote_dir, raise_on_error)
 
+    async def fetch_file(self, remote_path: str, local_path: str, *, raise_on_error: bool = False) -> None:
+        """从远端拉取文件到本地。失败默认仅日志，不影响压测收尾。"""
+        await asyncio.to_thread(self._fetch_sync, remote_path, local_path, raise_on_error)
+
     # --- 同步实现 ---
 
     def _telnet_sync(self, timeout_ms: int) -> bool:
@@ -117,6 +121,25 @@ class SSHClient:
             log.info("SCP 失败 host=%s %s -> %s: %s", self.host, local_path, remote_dir, e)
             if raise_on_error:
                 raise MysteriousException(Codes.SSH_EXEC_ERROR, message=f"文件同步到压力机失败: {local_path}") from e
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def _fetch_sync(self, remote_path: str, local_path: str, raise_on_error: bool = False) -> None:
+        client: paramiko.SSHClient | None = None
+        try:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            client = self._connect()
+            sftp = client.open_sftp()
+            sftp.get(remote_path, local_path)
+            sftp.close()
+        except Exception as e:
+            log.info("SCP 拉取失败 host=%s %s -> %s: %s", self.host, remote_path, local_path, e)
+            if raise_on_error:
+                raise MysteriousException(Codes.SSH_EXEC_ERROR, message=f"从压力机拉取文件失败: {remote_path}") from e
         finally:
             if client is not None:
                 try:

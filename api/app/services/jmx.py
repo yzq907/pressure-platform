@@ -20,10 +20,11 @@ from app.core.enums import JMeterSample, JMeterScript, JMeterThreads
 from app.core.exceptions import MysteriousException
 from app.core.jmeter_xml import JMeterXMLBuilder, update_debug_thread
 from app.core.response import PageVO
-from app.crud import csv as csv_crud
 from app.crud import jar as jar_crud
 from app.crud import jmx as jmx_crud
 from app.crud import testcase as testcase_crud
+from app.crud import testcase_csv_binding as testcase_csv_binding_crud
+from app.crud import testcase_upload_file_binding as testcase_upload_file_binding_crud
 from app.crud import jmx_assertion as jmx_assertion_crud
 from app.crud import jmx_concurrency_thread_group as jmx_concurrency_thread_group_crud
 from app.crud import jmx_csv as jmx_csv_crud
@@ -120,7 +121,7 @@ async def upload_jmx(
 
 
 async def delete_jmx(db: AsyncSession, id: int) -> bool:
-    """删 JMX 前必须确认用例下没有关联的 JAR/CSV"""
+    """删 JMX 前必须确认用例下没有关联的 JAR/公共文件绑定。"""
     obj = await jmx_crud.get_by_id(db, id)
     if obj is None:
         raise MysteriousException(Codes.FILE_NOT_EXIST)
@@ -128,9 +129,13 @@ async def delete_jmx(db: AsyncSession, id: int) -> bool:
     jars = await jar_crud.get_by_test_case_id(db, obj.test_case_id)
     if jars:
         raise MysteriousException(Codes.JMX_HAS_JAR)
-    csvs = await csv_crud.get_by_test_case_id(db, obj.test_case_id)
-    if csvs:
-        raise MysteriousException(Codes.JMX_HAS_CSV)
+    csv_bindings = await testcase_csv_binding_crud.get_by_test_case_id(db, obj.test_case_id)
+    upload_file_bindings = await testcase_upload_file_binding_crud.get_by_test_case_id(db, obj.test_case_id)
+    if csv_bindings or upload_file_bindings:
+        raise MysteriousException(
+            Codes.JMX_HAS_CSV,
+            message="JMX 已绑定公共参数化/上传文件，请先解绑后再删除",
+        )
 
     # ONLINE_JMX 模式级联删除 9 张子表
     if obj.jmeter_script_type == JMeterScript.ONLINE_JMX.value:
@@ -607,13 +612,10 @@ async def update_online_jmx(
     if obj.jmeter_script_type != JMeterScript.ONLINE_JMX.value:
         raise MysteriousException(Codes.JMX_ERROR)
 
-    # 1. 校验用例没 JAR/CSV
+    # 1. 校验用例没 JAR
     jars = await jar_crud.get_by_test_case_id(db, obj.test_case_id)
     if jars:
         raise MysteriousException(Codes.JMX_HAS_JAR)
-    csvs = await csv_crud.get_by_test_case_id(db, obj.test_case_id)
-    if csvs:
-        raise MysteriousException(Codes.JMX_HAS_CSV)
 
     # 2. Sample 类型不能改
     if jmx_vo.jmeter_sample_type != obj.jmeter_sample_type:

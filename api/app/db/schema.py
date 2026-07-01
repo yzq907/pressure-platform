@@ -125,47 +125,6 @@ _REPORT_COLUMNS = {
 }
 
 
-_CSV_COLUMNS = {
-    "distribution_strategy": {
-        "mysql": "varchar(32) NOT NULL DEFAULT 'shared' COMMENT '分布式参数文件读取策略'",
-        "default": "VARCHAR(32) NOT NULL DEFAULT 'shared'",
-    },
-}
-
-
-async def ensure_upload_file_table() -> None:
-    """Create upload-file resource table for upgraded deployments."""
-    async with async_engine.begin() as conn:
-        dialect = conn.dialect.name
-        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
-        if "mysterious_upload_file" in tables:
-            return
-
-        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
-        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
-        ddl = f"""
-        CREATE TABLE mysterious_upload_file (
-            id {id_type},
-            src_name varchar(255) NOT NULL DEFAULT '',
-            dst_name varchar(255) NOT NULL DEFAULT '',
-            description varchar(255) NOT NULL DEFAULT '',
-            file_dir varchar(255) NOT NULL DEFAULT '',
-            test_case_id bigint NOT NULL DEFAULT 0,
-            creator_id varchar(32) NOT NULL DEFAULT '',
-            creator varchar(32) NOT NULL DEFAULT '',
-            modifier_id varchar(32) NOT NULL DEFAULT '',
-            modifier varchar(32) NOT NULL DEFAULT '',
-            create_time {dt_default},
-            modify_time {dt_default},
-            PRIMARY KEY (id)
-        )
-        """
-        await conn.execute(text(ddl))
-        if dialect == "mysql":
-            await conn.execute(text("CREATE INDEX idx_test_case_id_upload_file ON mysterious_upload_file (test_case_id)"))
-        log.info("已创建 mysterious_upload_file 表")
-
-
 async def ensure_user_session_table() -> None:
     """Create user session token table for multi-client login."""
     async with async_engine.begin() as conn:
@@ -221,21 +180,101 @@ async def ensure_report_snapshot_columns() -> None:
             log.info("已补齐 mysterious_report.%s 字段", name)
 
 
-async def ensure_csv_distribution_columns() -> None:
-    """Add CSV distribution strategy column for existing databases."""
+async def ensure_csv_resource_tables() -> None:
+    """Create public CSV resource and testcase binding tables for upgraded deployments."""
     async with async_engine.begin() as conn:
         dialect = conn.dialect.name
-        columns = await conn.run_sync(
-            lambda sync_conn: {
-                col["name"] for col in inspect(sync_conn).get_columns("mysterious_csv")
-            }
-        )
-        for name, definitions in _CSV_COLUMNS.items():
-            if name in columns:
-                continue
-            ddl = definitions["mysql"] if dialect == "mysql" else definitions["default"]
-            await conn.execute(text(f"ALTER TABLE mysterious_csv ADD COLUMN {name} {ddl}"))
-            log.info("已补齐 mysterious_csv.%s 字段", name)
+        tables = await conn.run_sync(lambda sync_conn: set(inspect(sync_conn).get_table_names()))
+        id_type = "bigint(20) NOT NULL AUTO_INCREMENT" if dialect == "mysql" else "INTEGER NOT NULL"
+        bigint_type = "bigint NOT NULL DEFAULT 0" if dialect == "mysql" else "INTEGER NOT NULL DEFAULT 0"
+        dt_default = "datetime NOT NULL DEFAULT CURRENT_TIMESTAMP" if dialect == "mysql" else "DATETIME NOT NULL"
+
+        if "mysterious_csv_resource" not in tables:
+            await conn.execute(text(f"""
+            CREATE TABLE mysterious_csv_resource (
+                id {id_type},
+                filename varchar(255) NOT NULL DEFAULT '',
+                file_dir varchar(255) NOT NULL DEFAULT '',
+                file_type varchar(32) NOT NULL DEFAULT '',
+                description varchar(255) NOT NULL DEFAULT '',
+                file_size {bigint_type},
+                checksum varchar(64) NOT NULL DEFAULT '',
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """))
+            if dialect == "mysql":
+                await conn.execute(text("CREATE UNIQUE INDEX uk_mysterious_csv_resource_filename ON mysterious_csv_resource (filename)"))
+            log.info("已创建 mysterious_csv_resource 表")
+        else:
+            resource_columns = await conn.run_sync(
+                lambda sync_conn: {
+                    col["name"] for col in inspect(sync_conn).get_columns("mysterious_csv_resource")
+                }
+            )
+            if "file_type" not in resource_columns:
+                await conn.execute(text("ALTER TABLE mysterious_csv_resource ADD COLUMN file_type varchar(32) NOT NULL DEFAULT ''"))
+                log.info("已补齐 mysterious_csv_resource.file_type 字段")
+
+        if "mysterious_testcase_csv_binding" not in tables:
+            await conn.execute(text(f"""
+            CREATE TABLE mysterious_testcase_csv_binding (
+                id {id_type},
+                test_case_id {bigint_type},
+                filename varchar(255) NOT NULL DEFAULT '',
+                description varchar(255) NOT NULL DEFAULT '',
+                distribution_strategy varchar(32) NOT NULL DEFAULT 'shared',
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """))
+            if dialect == "mysql":
+                await conn.execute(text(
+                    "CREATE UNIQUE INDEX uk_testcase_csv_binding_case_filename "
+                    "ON mysterious_testcase_csv_binding (test_case_id, filename)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX idx_testcase_csv_binding_filename "
+                    "ON mysterious_testcase_csv_binding (filename)"
+                ))
+            log.info("已创建 mysterious_testcase_csv_binding 表")
+
+        if "mysterious_testcase_upload_file_binding" not in tables:
+            await conn.execute(text(f"""
+            CREATE TABLE mysterious_testcase_upload_file_binding (
+                id {id_type},
+                test_case_id {bigint_type},
+                filename varchar(255) NOT NULL DEFAULT '',
+                description varchar(255) NOT NULL DEFAULT '',
+                creator_id varchar(32) NOT NULL DEFAULT '',
+                creator varchar(32) NOT NULL DEFAULT '',
+                modifier_id varchar(32) NOT NULL DEFAULT '',
+                modifier varchar(32) NOT NULL DEFAULT '',
+                create_time {dt_default},
+                modify_time {dt_default},
+                PRIMARY KEY (id)
+            )
+            """))
+            if dialect == "mysql":
+                await conn.execute(text(
+                    "CREATE UNIQUE INDEX uk_testcase_upload_file_binding_case_filename "
+                    "ON mysterious_testcase_upload_file_binding (test_case_id, filename)"
+                ))
+                await conn.execute(text(
+                    "CREATE INDEX idx_testcase_upload_file_binding_filename "
+                    "ON mysterious_testcase_upload_file_binding (filename)"
+                ))
+            log.info("已创建 mysterious_testcase_upload_file_binding 表")
 
 
 async def ensure_rbac_schema() -> None:

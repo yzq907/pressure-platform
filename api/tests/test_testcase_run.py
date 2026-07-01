@@ -21,6 +21,7 @@ from lxml import etree
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.jmeter_error_samples import ERROR_SAMPLE_FILENAME, error_sample_dir_from_artifact_dir
 from app.core.enums import ExecType, NodeStatus, NodeType, TestCaseStatus
 from app.models.config import Config
 from app.models.execution_node import ExecutionNode
@@ -215,6 +216,49 @@ async def test_debug_success_flow(
     assert "Hello from fake JMeter" in reports[0].response_data
 
 
+@pytest.mark.asyncio
+async def test_debug_applies_public_csv_binding_to_debug_jmx(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+
+    case_id = await _create_case_with_jmx(auth_client, "dbg_public_csv", sample_jmx_bytes)
+    upload = await auth_client.post(
+        "/csv/resource/upload",
+        files={"csvFile": ("data.csv", b"h1,h2\n1,a\n", "text/csv")},
+    )
+    assert upload.json()["code"] == 0
+    bind = await auth_client.post(
+        "/csv/binding/add",
+        json={"testCaseId": case_id, "filename": "data.csv", "distributionStrategy": "shared"},
+    )
+    assert bind.json()["code"] == 0
+
+    resp = await auth_client.get(f"/testcase/debug/{case_id}")
+    assert resp.json()["code"] == 0
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+    debug_jmx = Path(captured["cmd"][captured["cmd"].index("-t") + 1])
+    tree = etree.parse(str(debug_jmx))
+    filenames = [
+        prop.text
+        for prop in tree.iter()
+        if prop.get("name") == "filename" and prop.text
+    ]
+    assert str(data_home / "common" / "csv" / "data.csv") in filenames
+
+
 # ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
@@ -267,9 +311,88 @@ async def test_run_no_slaves_no_R_flag(
     assert "-Jplatform.errorSampleTotalLimit=100" in captured["cmd"]
     run_jmx = Path(captured["cmd"][captured["cmd"].index("-t") + 1])
     tree = etree.parse(str(run_jmx))
-    listeners = tree.findall(".//JSR223Listener[@testname='平台错误请求采样']")
-    assert len(listeners) == 1
+    assert tree.findall(".//JSR223Listener[@testname='平台错误请求采样']") == []
+    samplers = tree.findall(".//HTTPSamplerProxy")
+    assertions = tree.findall(".//JSR223Assertion[@testname='平台错误请求采样']")
+    assert len(assertions) == len(samplers)
+    collectors = tree.findall(".//ResultCollector[@testname='平台错误结果树']")
+    assert len(collectors) == 1
+    assert collectors[0].find(".//responseData").text == "true"
+    assert collectors[0].find(".//requestHeaders").text == "true"
+    assert collectors[0].find(".//responseHeaders").text == "true"
+    assert "-Jsample_sender_strip_also_on_error=false" in captured["cmd"]
     await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_distributed_run_collects_error_samples_from_slaves(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    from app.core import ssh as ssh_mod
+
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    async def fake_fetch(self, remote_path: str, local_path: str, *, raise_on_error: bool = False) -> None:
+        captured.setdefault("fetches", []).append((self.host, remote_path, local_path, raise_on_error))
+        Path(local_path).write_text(
+            '{"errorType":"500","responseCode":"500","label":"remote-failed"}\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+    monkeypatch.setattr(ssh_mod.SSHClient, "fetch_file", fake_fetch)
+
+    case_id = await _create_case_with_jmx(auth_client, "r_dist_error_samples", sample_jmx_bytes)
+    db.add(
+        Node(
+            name="sample-slave",
+            type=NodeType.SLAVE.value,
+            host="10.0.9.9",
+            username="root",
+            password="x",
+            port=22,
+            status=NodeStatus.ENABLE.value,
+            health_status=1,
+        )
+    )
+    await db.commit()
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "1", "rampTime": "0", "duration": "1", "slaveCount": 1},
+    )
+
+    assert resp.json()["code"] == 0
+    report_id = resp.json()["data"]
+    cmd = captured["cmd"]
+    assert any(arg.startswith("-Gplatform.errorSampleFile=") for arg in cmd)
+    assert "-Gplatform.errorSamplePerCodeLimit=10" in cmd
+    assert "-Gplatform.errorSampleTotalLimit=100" in cmd
+    assert "-Gsample_sender_strip_also_on_error=false" in cmd
+
+    await jmeter_runner.wait_for_completion(report_id, timeout=10.0)
+
+    rpt = await db.get(Report, report_id)
+    error_sample_dir = error_sample_dir_from_artifact_dir(rpt.artifact_dir)
+    sample_path = error_sample_dir / ERROR_SAMPLE_FILENAME
+    assert sample_path.exists()
+    assert "remote-failed" in sample_path.read_text(encoding="utf-8")
+    assert captured["fetches"]
+    host, remote_path, _, raise_on_error = captured["fetches"][0]
+    assert host == "10.0.9.9"
+    assert remote_path == str(error_sample_dir / ERROR_SAMPLE_FILENAME)
+    assert raise_on_error is False
+    assert any(item[1] == str(error_sample_dir / "error_samples.xml") for item in captured["fetches"])
 
 
 @pytest.mark.asyncio
@@ -978,14 +1101,10 @@ async def test_run_syncs_current_case_dependencies_to_selected_slaves(
     db: AsyncSession,
     monkeypatch,
 ) -> None:
-    """执行前应把当前用例 CSV/JAR 补同步到本次选中的压力机。"""
+    """执行前只同步当前用例仍支持的依赖；旧本地 CSV 不再参与运行。"""
     from app.core import ssh as ssh_mod
 
     case_id = await _create_case_with_jmx(auth_client, "r_sync_deps", sample_jmx_bytes)
-    await auth_client.post(
-        f"/csv/upload/{case_id}",
-        files={"csvFile": ("data.csv", b"a,b\n1,2\n", "text/csv")},
-    )
     await auth_client.post(
         f"/jar/upload/{case_id}",
         files={"jarFile": ("dep.jar", b"x", "application/java-archive")},
@@ -1019,190 +1138,10 @@ async def test_run_syncs_current_case_dependencies_to_selected_slaves(
     assert resp.json()["code"] == 0
     await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
 
-    assert len(scp_calls) == 2
+    assert len(scp_calls) == 1
     assert all(call[2] is True for call in scp_calls)
-    assert any(local_path.endswith("/csv/data.csv") for local_path, _, _ in scp_calls)
+    assert not any(local_path.endswith("/csv/data.csv") for local_path, _, _ in scp_calls)
     assert any(local_path.endswith("/jar/dep.jar") for local_path, _, _ in scp_calls)
-
-
-@pytest.mark.asyncio
-async def test_run_syncs_upload_file_and_rewrites_run_jmx(
-    auth_client: AsyncClient,
-    data_home: Path,
-    jmeter_bin_home: Path,
-    db: AsyncSession,
-    monkeypatch,
-) -> None:
-    """执行前应同步上传接口文件，并把 run JMX 中 File.path 改为平台路径。"""
-    from app.core import ssh as ssh_mod
-
-    case_id = await _create_case_with_jmx(auth_client, "r_sync_upload", UPLOAD_FILE_JMX)
-    await auth_client.post(
-        f"/uploadFile/upload/{case_id}",
-        files={"uploadFile": ("avatar.jpg", b"img", "image/jpeg")},
-    )
-
-    scp_calls: list[tuple[str, str, bool]] = []
-
-    async def tracking_scp(self, local_path: str, remote_dir: str, *, raise_on_error: bool = False) -> None:
-        scp_calls.append((local_path, remote_dir, raise_on_error))
-
-    monkeypatch.setattr(ssh_mod.SSHClient, "scp_file", tracking_scp)
-
-    db.add(
-        Node(
-            name="upload-sync-slave",
-            type=NodeType.SLAVE.value,
-            host="10.0.9.2",
-            username="root",
-            password="x",
-            port=22,
-            status=NodeStatus.ENABLE.value,
-            health_status=1,
-        )
-    )
-    await db.commit()
-
-    resp = await auth_client.post(
-        f"/testcase/run/{case_id}",
-        json={"numThreads": "10", "rampTime": "0", "duration": "60", "slaveCount": 1},
-    )
-    assert resp.json()["code"] == 0
-    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
-
-    upload_path = str(next(data_home.glob("r_sync_upload_*/upload/avatar.jpg")))
-    assert any(local_path == upload_path and raise_on_error is True for local_path, _, raise_on_error in scp_calls)
-
-    run_jmx = next(data_home.glob("r_sync_upload_*/jmx/run_*.jmx"))
-    assert upload_path in run_jmx.read_text(encoding="utf-8")
-
-
-@pytest.mark.asyncio
-async def test_run_splits_marked_csv_per_slave_and_rewrites_run_jmx(
-    auth_client: AsyncClient,
-    data_home: Path,
-    jmeter_bin_home: Path,
-    sample_jmx_bytes: bytes,
-    db: AsyncSession,
-    monkeypatch,
-) -> None:
-    """仅标记为 split_by_slave 的 CSV 会按本次 slave 切片，并改写 run JMX 到执行专属路径。"""
-    from app.core import ssh as ssh_mod
-    from app.models.csv import Csv
-
-    captured: dict = {}
-    real_launch = jmeter_runner.launch_jmeter
-
-    async def spy(cmd, **kw):
-        captured["cmd"] = cmd
-        return await real_launch(cmd, **kw)
-
-    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
-
-    case_id = await _create_case_with_jmx(auth_client, "r_split_csv", sample_jmx_bytes)
-    await auth_client.post(
-        f"/csv/upload/{case_id}",
-        files={"csvFile": ("data.csv", b"h1,h2\n1,a\n2,b\n3,c\n4,d\n", "text/csv")},
-    )
-    csv_obj = (await db.execute(select(Csv).where(Csv.test_case_id == case_id))).scalar_one()
-    csv_obj.distribution_strategy = "split_by_slave"
-
-    for h in ("10.0.8.1", "10.0.8.2"):
-        db.add(
-            Node(
-                name=h,
-                type=NodeType.SLAVE.value,
-                host=h,
-                username="root",
-                password="x",
-                port=22,
-                status=NodeStatus.ENABLE.value,
-                health_status=1,
-            )
-        )
-    await db.commit()
-
-    scp_payloads: dict[str, bytes] = {}
-
-    async def capture_scp(self, local_path: str, remote_dir: str, *, raise_on_error: bool = False) -> None:
-        if "runtime_csv" in local_path:
-            scp_payloads[self.host] = Path(local_path).read_bytes()
-
-    monkeypatch.setattr(ssh_mod.SSHClient, "scp_file", capture_scp)
-
-    resp = await auth_client.post(
-        f"/testcase/run/{case_id}",
-        json={"numThreads": "20", "rampTime": "0", "duration": "60", "slaveCount": 2},
-    )
-    assert resp.json()["code"] == 0
-    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
-
-    assert set(scp_payloads) == {"10.0.8.1", "10.0.8.2"}
-    assert scp_payloads["10.0.8.1"] == b"h1,h2\n1,a\n3,c\n"
-    assert scp_payloads["10.0.8.2"] == b"h1,h2\n2,b\n4,d\n"
-
-    run_jmx = Path(captured["cmd"][captured["cmd"].index("-t") + 1])
-    assert "runtime_csv" in run_jmx.read_text(encoding="utf-8")
-    assert "report/" in run_jmx.read_text(encoding="utf-8")
-
-
-@pytest.mark.asyncio
-async def test_run_splits_marked_csv_without_ignore_first_line(
-    auth_client: AsyncClient,
-    data_home: Path,
-    jmeter_bin_home: Path,
-    sample_jmx_bytes: bytes,
-    db: AsyncSession,
-    monkeypatch,
-) -> None:
-    """JMX 未配置 ignoreFirstLine 时，第一行也必须作为数据切片，避免 .dat/无表头文件丢数据。"""
-    from app.core import ssh as ssh_mod
-    from app.models.csv import Csv
-
-    jmx_bytes = sample_jmx_bytes.replace(
-        b'<boolProp name="ignoreFirstLine">true</boolProp>',
-        b'<boolProp name="ignoreFirstLine">false</boolProp>',
-    )
-    case_id = await _create_case_with_jmx(auth_client, "r_split_dat", jmx_bytes)
-    await auth_client.post(
-        f"/csv/upload/{case_id}",
-        files={"csvFile": ("data.csv", b"1,a\n2,b\n3,c\n4,d\n", "text/csv")},
-    )
-    csv_obj = (await db.execute(select(Csv).where(Csv.test_case_id == case_id))).scalar_one()
-    csv_obj.distribution_strategy = "split_by_slave"
-
-    for h in ("10.0.9.1", "10.0.9.2"):
-        db.add(
-            Node(
-                name=h,
-                type=NodeType.SLAVE.value,
-                host=h,
-                username="root",
-                password="x",
-                port=22,
-                status=NodeStatus.ENABLE.value,
-                health_status=1,
-            )
-        )
-    await db.commit()
-
-    scp_payloads: dict[str, bytes] = {}
-
-    async def capture_scp(self, local_path: str, remote_dir: str, *, raise_on_error: bool = False) -> None:
-        if "runtime_csv" in local_path:
-            scp_payloads[self.host] = Path(local_path).read_bytes()
-
-    monkeypatch.setattr(ssh_mod.SSHClient, "scp_file", capture_scp)
-
-    resp = await auth_client.post(
-        f"/testcase/run/{case_id}",
-        json={"numThreads": "20", "rampTime": "0", "duration": "60", "slaveCount": 2},
-    )
-    assert resp.json()["code"] == 0
-    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
-
-    assert scp_payloads["10.0.9.1"] == b"1,a\n3,c\n"
-    assert scp_payloads["10.0.9.2"] == b"2,b\n4,d\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1699,11 +1638,7 @@ async def test_get_full(
     sample_jmx_bytes: bytes,
 ) -> None:
     case_id = await _create_case_with_jmx(auth_client, "gf", sample_jmx_bytes)
-    # 加 CSV + JAR
-    await auth_client.post(
-        f"/csv/upload/{case_id}",
-        files={"csvFile": ("data.csv", b"a,b\n1,2\n", "text/csv")},
-    )
+    # 加 JAR
     await auth_client.post(
         f"/jar/upload/{case_id}",
         files={"jarFile": ("dep.jar", b"x", "application/java-archive")},
@@ -1712,8 +1647,9 @@ async def test_get_full(
     resp = await auth_client.get(f"/testcase/getFull/{case_id}")
     data = resp.json()["data"]
     assert data["jmxVO"]["srcName"] == "test.jmx"
-    assert len(data["csvVOList"]) == 1
+    assert "csvVOList" not in data
     assert len(data["jarVOList"]) == 1
+    assert "uploadFileVOList" not in data
 
 
 # ---------------------------------------------------------------------------
@@ -1749,7 +1685,7 @@ async def test_sync_node_scp_called_for_csv_and_jar(
     db: AsyncSession,
     monkeypatch,
 ) -> None:
-    """新增 slave 时，应给每个用例的 csv/jar 调 scp_file"""
+    """新增 slave 时只同步仍支持的 JAR 等依赖。"""
     from app.core import ssh as ssh_mod
 
     scp_calls: list[tuple[str, str]] = []
@@ -1760,10 +1696,6 @@ async def test_sync_node_scp_called_for_csv_and_jar(
     monkeypatch.setattr(ssh_mod.SSHClient, "scp_file", tracking_scp)
 
     case_id = await _create_case_with_jmx(auth_client, "sn", sample_jmx_bytes)
-    await auth_client.post(
-        f"/csv/upload/{case_id}",
-        files={"csvFile": ("data.csv", b"a,b\n1,2\n", "text/csv")},
-    )
     await auth_client.post(
         f"/jar/upload/{case_id}",
         files={"jarFile": ("dep.jar", b"x", "application/java-archive")},
@@ -1787,8 +1719,65 @@ async def test_sync_node_scp_called_for_csv_and_jar(
 
     resp = await auth_client.get(f"/testcase/syncNode/{n.id}")
     assert resp.json()["code"] == 0
-    # 1 个 csv + 1 个 jar = 2 次 scp
-    assert len(scp_calls) == 2
+    assert len(scp_calls) == 1
+    assert scp_calls[0][0].endswith("/jar/dep.jar")
+
+
+@pytest.mark.asyncio
+async def test_sync_node_skips_missing_public_file_bindings(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    """syncNode 是全量补同步，公共文件被强制删除后应跳过缺失绑定，不阻断其他文件。"""
+    from app.core import ssh as ssh_mod
+
+    scp_calls: list[tuple[str, str]] = []
+
+    async def tracking_scp(self, local_path: str, remote_dir: str, *, raise_on_error: bool = False) -> None:
+        scp_calls.append((local_path, remote_dir))
+
+    monkeypatch.setattr(ssh_mod.SSHClient, "scp_file", tracking_scp)
+
+    case_id = await _create_case_with_jmx(auth_client, "sn_missing_public", sample_jmx_bytes)
+    await auth_client.post(
+        "/csv/resource/upload",
+        files={"csvFile": ("data.csv", b"a,b\n1,2\n", "text/csv")},
+    )
+    bind = await auth_client.post(
+        "/csv/binding/add",
+        json={"testCaseId": case_id, "filename": "data.csv", "distributionStrategy": "shared"},
+    )
+    assert bind.json()["code"] == 0
+    delete_force = await auth_client.get("/csv/resource/delete/data.csv?force=true")
+    assert delete_force.json()["code"] == 0
+    await auth_client.post(
+        f"/jar/upload/{case_id}",
+        files={"jarFile": ("dep.jar", b"x", "application/java-archive")},
+    )
+
+    scp_calls.clear()
+
+    n = Node(
+        name="newslv-missing-public",
+        type=NodeType.SLAVE.value,
+        host="10.0.0.101",
+        username="root",
+        password="x",
+        port=22,
+        status=NodeStatus.DISABLED.value,
+    )
+    db.add(n)
+    await db.commit()
+    await db.refresh(n)
+
+    resp = await auth_client.get(f"/testcase/syncNode/{n.id}")
+    assert resp.json()["code"] == 0
+    assert len(scp_calls) == 1
+    assert scp_calls[0][0].endswith("/jar/dep.jar")
 
 
 @pytest.mark.asyncio
@@ -1806,8 +1795,8 @@ async def test_sync_node_reports_scp_failure(
 
     case_id = await _create_case_with_jmx(auth_client, "sn_fail", sample_jmx_bytes)
     await auth_client.post(
-        f"/csv/upload/{case_id}",
-        files={"csvFile": ("data.csv", b"a,b\n1,2\n", "text/csv")},
+        f"/jar/upload/{case_id}",
+        files={"jarFile": ("dep.jar", b"x", "application/java-archive")},
     )
 
     async def failing_scp(self, local_path: str, remote_dir: str, *, raise_on_error: bool = False) -> None:
@@ -1833,7 +1822,7 @@ async def test_sync_node_reports_scp_failure(
     body = resp.json()
     assert body["code"] == -1
     assert "同步失败" in body["message"]
-    assert "data.csv" in body["message"]
+    assert "dep.jar" in body["message"]
 
 
 # ---------------------------------------------------------------------------

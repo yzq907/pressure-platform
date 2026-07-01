@@ -126,7 +126,7 @@ async def lifespan(app: FastAPI):
     from app.db.schema import (
         ensure_ai_generation_tables,
         ensure_config_value_text_column,
-        ensure_csv_distribution_columns,
+        ensure_csv_resource_tables,
         ensure_execution_node_table,
         ensure_execution_queue_table,
         ensure_execution_run_table,
@@ -136,13 +136,12 @@ async def lifespan(app: FastAPI):
         ensure_rbac_schema,
         ensure_report_snapshot_columns,
         ensure_scheduled_task_log_table,
-        ensure_upload_file_table,
         ensure_user_session_table,
     )
     await ensure_config_value_text_column()
     await ensure_ai_generation_tables()
     await ensure_report_snapshot_columns()
-    await ensure_csv_distribution_columns()
+    await ensure_csv_resource_tables()
     await ensure_rbac_schema()
     await ensure_scheduled_task_log_table()
     await ensure_execution_queue_table()
@@ -151,7 +150,6 @@ async def lifespan(app: FastAPI):
     await ensure_report_metric_snapshot_table()
     await ensure_report_transaction_snapshot_table()
     await ensure_report_transaction_metric_snapshot_table()
-    await ensure_upload_file_table()
     await ensure_user_session_table()
 
     # 初始化：创建 admin 用户（如不存在）

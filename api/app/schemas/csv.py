@@ -5,28 +5,38 @@ from __future__ import annotations
 from app.schemas.base import BaseQuery, BaseVO, CamelModel
 
 
-class CsvParam(CamelModel):
-    src_name: str | None = None
-    dst_name: str | None = None
-    description: str | None = None
-    csv_dir: str | None = None
-    distribution_strategy: str | None = None
-    test_case_id: int | None = None
-
-
 class CsvStrategyParam(CamelModel):
     distribution_strategy: str
 
 
-class CsvVO(BaseVO):
-    src_name: str = ""
-    dst_name: str = ""
+class CsvResourceVO(BaseVO):
+    filename: str = ""
+    file_dir: str = ""
+    file_type: str = ""
     description: str = ""
-    csv_dir: str = ""
+    file_size: int = 0
+    checksum: str = ""
+    reference_count: int = 0
+    csv_reference_count: int = 0
+    upload_file_reference_count: int = 0
+    exists: bool = True
+
+
+class CsvBindingParam(CamelModel):
+    test_case_id: int
+    filename: str
     distribution_strategy: str = "shared"
+    description: str | None = None
+
+
+class CsvBindingVO(BaseVO):
     test_case_id: int = 0
+    filename: str = ""
+    description: str = ""
+    distribution_strategy: str = "shared"
+    exists: bool = False
 
 
-class CsvQuery(BaseQuery):
-    src_name: str | None = None
-    test_case_id: int | None = None
+class CsvResourceQuery(BaseQuery):
+    filename: str | None = None
+    file_type: str | None = None

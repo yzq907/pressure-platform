@@ -23,12 +23,21 @@ import subprocess
 import time
 from asyncio.subprocess import PIPE, Process
 from datetime import datetime
+from pathlib import Path
 
 from lxml import etree
 from sqlalchemy import select
 
+from app.core.jmeter_error_samples import (
+    ERROR_SAMPLE_FILENAME,
+    ERROR_SAMPLE_XML_FILENAME,
+    error_sample_dir_from_artifact_dir,
+)
+from app.core.ssh import SSHClient
 from app.core.enums import ExecType, TestCaseStatus
 from app.db import session as session_module
+from app.models.execution_node import ExecutionNode
+from app.models.node import Node
 from app.models.execution_run import ExecutionRun
 from app.models.report import Report
 from app.models.testcase import TestCase
@@ -657,6 +666,8 @@ async def _run_and_callback(
         output_failed,
         final_status.value,
     )
+    if exec_type == ExecType.EXEC.value:
+        await _collect_remote_error_samples(report_id)
     updated = await _safe_update_testcase_and_report(testcase_id, report_id, final_status, response_data)
     run_status = "success" if final_status == TestCaseStatus.RUN_SUCCESS else "failed"
     run_message = "JMeter 执行完成" if run_status == "success" else "JMeter 执行失败"
@@ -673,6 +684,56 @@ async def _run_and_callback(
     if updated and exec_type == ExecType.EXEC.value:
         _schedule_metric_snapshot(report_id)
     _running_processes.pop(report_id, None)
+
+
+async def _collect_remote_error_samples(report_id: int) -> None:
+    try:
+        async with session_module.AsyncSessionLocal() as db:
+            rpt = await db.get(Report, report_id)
+            if rpt is None or not rpt.artifact_dir:
+                return
+            rows = list(
+                (
+                    await db.execute(
+                        select(Node)
+                        .join(ExecutionNode, ExecutionNode.node_id == Node.id)
+                        .where(ExecutionNode.report_id == report_id)
+                        .order_by(ExecutionNode.id.asc())
+                    )
+                ).scalars().all()
+            )
+            if not rows:
+                return
+            error_sample_dir = error_sample_dir_from_artifact_dir(rpt.artifact_dir)
+            error_sample_dir.mkdir(parents=True, exist_ok=True)
+            merged_path = error_sample_dir / ERROR_SAMPLE_FILENAME
+            remote_path = str(error_sample_dir / ERROR_SAMPLE_FILENAME)
+            for node in rows:
+                safe_host = re.sub(r"[^A-Za-z0-9_.-]", "_", node.host or str(node.id))
+                tmp_path = error_sample_dir / f"error_samples.{safe_host}.jsonl"
+                ssh = SSHClient(node.host, node.port, node.username, node.password)
+                await ssh.fetch_file(remote_path, str(tmp_path), raise_on_error=False)
+                if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+                    continue
+                with tmp_path.open("r", encoding="utf-8", errors="replace") as src:
+                    with merged_path.open("a", encoding="utf-8") as dst:
+                        for line in src:
+                            if line.strip():
+                                dst.write(line if line.endswith("\n") else line + "\n")
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                remote_xml_path = str(error_sample_dir / ERROR_SAMPLE_XML_FILENAME)
+                local_xml_path = error_sample_dir / f"error_samples.{safe_host}.xml"
+                await ssh.fetch_file(remote_xml_path, str(local_xml_path), raise_on_error=False)
+                if local_xml_path.exists() and local_xml_path.stat().st_size <= 0:
+                    try:
+                        local_xml_path.unlink()
+                    except OSError:
+                        pass
+    except Exception:
+        log.exception("分布式错误样本拉取失败: report_id=%s", report_id)
 
 
 def _schedule_metric_snapshot(report_id: int) -> None:

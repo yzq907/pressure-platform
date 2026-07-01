@@ -5,10 +5,10 @@ from __future__ import annotations
 from pydantic import Field
 
 from app.schemas.base import BaseQuery, BaseVO, CamelModel
-from app.schemas.csv import CsvVO
+from app.schemas.csv import CsvBindingVO
 from app.schemas.jar import JarVO
 from app.schemas.jmx import JmxVO
-from app.schemas.upload_file import UploadFileVO
+from app.schemas.upload_file import UploadFileBindingVO
 
 
 class TestCaseParam(CamelModel):
@@ -66,15 +66,18 @@ class BatchDeleteParam(CamelModel):
 
 
 class TestCaseFullVO(TestCaseVO):
-    """对齐 Java TestCaseFullVO：用例 + 关联的 JMX/CSV/JAR/上传接口文件。
+    """用例详情：用例 + JMX/JAR + 公共参数文件/上传文件绑定。
 
-    显式指定 alias 让 JSON key 是 `jmxVO/csvVOList/jarVOList`，对齐 Java（默认 to_camel 会得到 jmxVo/csvVoList）。
+    显式指定 alias 让 JSON key 是 `jmxVO/jarVOList`，对齐前端已有字段命名。
     """
 
     jmx_vo: JmxVO | None = Field(default=None, alias="jmxVO")
-    csv_vo_list: list[CsvVO] = Field(default_factory=list, alias="csvVOList")
+    csv_binding_vo_list: list[CsvBindingVO] = Field(default_factory=list, alias="csvBindingVOList")
     jar_vo_list: list[JarVO] = Field(default_factory=list, alias="jarVOList")
-    upload_file_vo_list: list[UploadFileVO] = Field(default_factory=list, alias="uploadFileVOList")
+    upload_file_binding_vo_list: list[UploadFileBindingVO] = Field(
+        default_factory=list,
+        alias="uploadFileBindingVOList",
+    )
 
 
 class RunParam(CamelModel):

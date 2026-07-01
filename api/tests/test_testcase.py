@@ -320,15 +320,12 @@ async def _setup_case_with_all_deps(
     auth_client: AsyncClient,
     name: str,
     jmx_bytes: bytes,
-    csv_name: str = "data.csv",
 ) -> int:
-    """辅助：创建用例 + 上传 JMX + CSV + JAR"""
+    """辅助：创建用例 + 上传 JMX + JAR"""
     resp = await auth_client.post("/testcase/add", json={"name": name})
     case_id = resp.json()["data"]
     jmx_files = {"jmxFile": ("test.jmx", jmx_bytes, "application/octet-stream")}
     await auth_client.post(f"/jmx/upload/{case_id}", files=jmx_files)
-    csv_files = {"csvFile": (csv_name, b"a,b\n1,2\n", "text/csv")}
-    await auth_client.post(f"/csv/upload/{case_id}", files=csv_files)
     jar_files = {"jarFile": ("dep.jar", b"x", "application/java-archive")}
     await auth_client.post(f"/jar/upload/{case_id}", files=jar_files)
     return case_id
@@ -353,26 +350,6 @@ async def test_rename_cascades_jmx_description(
     jmx = (await db.execute(select(Jmx).where(Jmx.test_case_id == case_id))).scalar_one()
     await db.refresh(jmx)
     assert jmx.description == "case_renamed"
-
-
-@pytest.mark.asyncio
-async def test_rename_cascades_csv_description(
-    auth_client: AsyncClient,
-    data_home: Path,
-    jmeter_home: Path,
-    sample_jmx_bytes: bytes,
-    db: AsyncSession,
-) -> None:
-    from app.models.csv import Csv
-
-    case_id = await _setup_case_with_all_deps(auth_client, "case_csv_orig", sample_jmx_bytes)
-
-    await auth_client.post(f"/testcase/update/{case_id}", json={"name": "case_csv_renamed"})
-
-    csvs = (await db.execute(select(Csv).where(Csv.test_case_id == case_id))).scalars().all()
-    assert len(csvs) == 1
-    await db.refresh(csvs[0])
-    assert csvs[0].description == "case_csv_renamed"
 
 
 @pytest.mark.asyncio

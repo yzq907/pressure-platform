@@ -1,0 +1,1 @@
+import{R as t}from"./index.fc0a0725.js";const r=u=>{if(u=="\u7528\u6237\u51ED\u8BC1\u5931\u6548"||u=="\u7528\u6237\u4E0D\u5B58\u5728"||u=="\u7528\u6237\u672A\u767B\u5F55")return t.push({path:"/login"}),!1},s=u=>{t.push({path:"/testcase",query:{id:u}})};export{r as c,s as h};
