@@ -77,6 +77,7 @@ from app.services import report as report_service
 from app.core.jmeter_xml import (
     apply_thread_group_pacing,
     csv_ignore_first_line,
+    enable_transaction_parent_samples,
     list_thread_groups,
     list_transactions,
     sum_enabled_thread_group_threads,
@@ -92,6 +93,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 DATA_HOME_KEY = "MASTER_DATA_HOME"
 MASTER_JMETER_BIN_HOME_KEY = "MASTER_JMETER_BIN_HOME"
 INIT_ARTIFACT_TESTCASE_IDS_KEY = "INIT_ARTIFACT_TESTCASE_IDS"
+JMETER_REPORT_BY_TRANSACTION_KEY = "JMETER_REPORT_BY_TRANSACTION"
 _REMOTE_STOP_WAIT_SECONDS = 3
 _REMOTE_RESTART_WAIT_SECONDS = 3
 _REMOTE_RESTART_ATTEMPTS = 2
@@ -101,8 +103,9 @@ _JMETER_SERVER_KILL_CMD = (
     "ps -ef | awk '/jmeter-server/ && !/awk/ {print $2}' | xargs -r kill -9"
 )
 
-# Java 端 addTestCase 校验：name 不能含空格或 #
+# Java 端 addTestCase 校验：name 不能为空，且不能含空白字符或 #
 _BAD_NAME_CHARS = re.compile(r"[\s#]")
+_TESTCASE_NAME_ERROR_MESSAGE = "用例名称异常：不能为空，且不能包含空格、#"
 
 # JMeter 实时日志解析正则（对齐 Java getJMeterResult）
 _JMETER_RESULT_RE = re.compile(
@@ -135,7 +138,7 @@ class RuntimeUploadFileRef:
 
 def _check_name(name: str | None) -> None:
     if not name or _BAD_NAME_CHARS.search(name):
-        raise MysteriousException(Codes.TESTCASE_NAME_ERROR)
+        raise MysteriousException(Codes.TESTCASE_NAME_ERROR, message=_TESTCASE_NAME_ERROR_MESSAGE)
 
 
 def _to_vo(obj: TestCase) -> TestCaseVO:
@@ -327,6 +330,17 @@ def _resolve_run_report_name(testcase_name: str, task_name: str | None, ts: str)
     return display_name[:255]
 
 
+def _config_bool(raw: str | None, default: bool = True) -> bool:
+    value = (raw or "").strip().lower()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _cleanup_old_run_jmx(jmx_dir: str, testcase_id: int, keep: int = 5) -> None:
     """清理旧的 run_*.jmx 临时文件，只保留最近 keep 个。"""
     pattern = re.compile(rf"^run_(\d{{4}}-\d{{2}}-\d{{2}}-\d{{2}}:\d{{2}}:\d{{2}})_{testcase_id}\.jmx$")
@@ -368,6 +382,7 @@ def _write_run_meta(
     slave_count: int,
     per_slave_threads: int,
     slave_hosts: list[str] | None = None,
+    report_by_transaction: bool = True,
 ) -> None:
     """记录本次执行的线程快照，供实时曲线把单机 JTL 线程数换算为总线程数。"""
     report_root = Path(data_dir).resolve().parent
@@ -377,6 +392,7 @@ def _write_run_meta(
         "slave_count": slave_count,
         "per_slave_threads": per_slave_threads,
         "slave_hosts": slave_hosts or [],
+        "report_by_transaction": report_by_transaction,
     }
     try:
         meta_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1023,6 +1039,13 @@ async def _run_testcase_now(
         duration,
         thread_group_overrides,
     )
+    transaction_report_enabled = _config_bool(
+        await config_service.get_value_or_default(db, JMETER_REPORT_BY_TRANSACTION_KEY, "true"),
+        default=True,
+    )
+    report_by_transaction = bool(
+        transaction_report_enabled and enable_transaction_parent_samples(run_jmx_path) > 0
+    )
     runtime_csvs, upload_files = await _apply_runtime_file_refs(db, id, run_jmx_path)
     actual_slave_count = max(1, slave_count)
     apply_thread_group_pacing(run_jmx_path, run_jmx_path, thread_group_overrides)
@@ -1058,6 +1081,7 @@ async def _run_testcase_now(
         slave_count=actual_slave_count,
         per_slave_threads=per_slave_threads,
         slave_hosts=remote_hosts,
+        report_by_transaction=report_by_transaction,
     )
 
     cmd = [
@@ -1077,6 +1101,8 @@ async def _run_testcase_now(
         f"-J{ERROR_SAMPLE_TEXT_MAX_BYTES_PROP}={DEFAULT_ERROR_SAMPLE_TEXT_MAX_BYTES}",
         "-Jsample_sender_strip_also_on_error=false",
     ]
+    if report_by_transaction:
+        cmd.append("-Jjmeter.save.saveservice.subresults=false")
     if healthy_slaves:
         cmd += [
             f"-G{ERROR_SAMPLE_FILE_PROP}={error_sample_path}",
@@ -1085,6 +1111,8 @@ async def _run_testcase_now(
             f"-G{ERROR_SAMPLE_TEXT_MAX_BYTES_PROP}={DEFAULT_ERROR_SAMPLE_TEXT_MAX_BYTES}",
             "-Gsample_sender_strip_also_on_error=false",
         ]
+        if report_by_transaction:
+            cmd.append("-Gjmeter.save.saveservice.subresults=false")
     cmd += [
         "-l",
         jtl_path,

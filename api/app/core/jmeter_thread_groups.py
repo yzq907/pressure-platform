@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from lxml import etree
+
 from app.core.jmeter_xml_support import (
     first_named_prop_text,
     is_enabled,
@@ -171,6 +173,23 @@ def list_transactions(jmx_path: str) -> list[dict[str, str]]:
             "enabled": is_enabled(node),
         })
     return thread_groups
+
+
+def enable_transaction_parent_samples(jmx_path: str) -> int:
+    """Enable parent samples and return the number of enabled controllers."""
+    tree = parse_jmx(jmx_path)
+    enabled_count = 0
+    for node in tree.iter("TransactionController"):
+        if not _is_transaction_controller(node) or not is_enabled(node):
+            continue
+        enabled_count += 1
+        prop = node.find("./boolProp[@name='TransactionController.parent']")
+        if prop is None:
+            prop = etree.SubElement(node, "boolProp", name="TransactionController.parent")
+        if prop.text != "true":
+            prop.text = "true"
+    write_jmx(tree, jmx_path)
+    return enabled_count
 
 
 def _override_key(item: dict[str, str]) -> str:

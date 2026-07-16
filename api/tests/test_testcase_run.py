@@ -321,6 +321,42 @@ async def test_run_no_slaves_no_R_flag(
     assert collectors[0].find(".//requestHeaders").text == "true"
     assert collectors[0].find(".//responseHeaders").text == "true"
     assert "-Jsample_sender_strip_also_on_error=false" in captured["cmd"]
+    assert "-Jjmeter.save.saveservice.subresults=false" not in captured["cmd"]
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_subresults_when_transaction_report_disabled(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    sample_jmx_bytes: bytes,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+    db.add(
+        Config(
+            config_key="JMETER_REPORT_BY_TRANSACTION",
+            config_value="false",
+            description="JMeter报告按事务聚合",
+        )
+    )
+    await db.commit()
+
+    case_id = await _create_case_with_jmx(auth_client, "r_no_subresults", sample_jmx_bytes)
+    resp = await auth_client.get(f"/testcase/run/{case_id}")
+
+    assert resp.json()["code"] == 0
+    assert "-Jjmeter.save.saveservice.subresults=false" not in captured["cmd"]
+    assert "-Gjmeter.save.saveservice.subresults=false" not in captured["cmd"]
     await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
 
 
@@ -393,6 +429,55 @@ async def test_distributed_run_collects_error_samples_from_slaves(
     assert remote_path == str(error_sample_dir / ERROR_SAMPLE_FILENAME)
     assert raise_on_error is False
     assert any(item[1] == str(error_sample_dir / "error_samples.xml") for item in captured["fetches"])
+
+
+@pytest.mark.asyncio
+async def test_distributed_run_passes_subresults_false_to_slaves_in_transaction_mode(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    db: AsyncSession,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+    db.add(
+        Config(
+            config_key="JMETER_REPORT_BY_TRANSACTION",
+            config_value="true",
+            description="JMeter报告按事务聚合",
+        )
+    )
+    db.add(
+        Node(
+            name="slave-subresults",
+            type=NodeType.SLAVE.value,
+            host="10.0.9.10",
+            username="root",
+            password="x",
+            port=22,
+            status=NodeStatus.ENABLE.value,
+            health_status=1,
+        )
+    )
+    await db.commit()
+
+    case_id = await _create_case_with_jmx(auth_client, "r_dist_no_subresults", TRANSACTION_JMX)
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "1", "rampTime": "0", "duration": "1", "slaveCount": 1},
+    )
+
+    assert resp.json()["code"] == 0
+    assert "-Jjmeter.save.saveservice.subresults=false" in captured["cmd"]
+    assert "-Gjmeter.save.saveservice.subresults=false" in captured["cmd"]
+    await jmeter_runner.wait_for_completion(resp.json()["data"], timeout=10.0)
 
 
 @pytest.mark.asyncio
@@ -618,6 +703,42 @@ async def test_run_transactions_lists_transaction_controllers(
             "enabled": True,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_transaction_mode_enables_parent_samples_and_records_mode(
+    auth_client: AsyncClient,
+    data_home: Path,
+    jmeter_bin_home: Path,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    real_launch = jmeter_runner.launch_jmeter
+
+    async def spy(cmd, **kw):
+        captured["cmd"] = cmd
+        return await real_launch(cmd, **kw)
+
+    monkeypatch.setattr(jmeter_runner, "launch_jmeter", spy)
+    case_id = await _create_case_with_jmx(auth_client, "r_transaction_mode", TRANSACTION_JMX)
+
+    resp = await auth_client.post(
+        f"/testcase/run/{case_id}",
+        json={"numThreads": "1", "rampTime": "0", "duration": "1", "slaveCount": 0},
+    )
+
+    assert resp.json()["code"] == 0
+    assert "-Jjmeter.save.saveservice.subresults=false" in captured["cmd"]
+    run_jmx = Path(captured["cmd"][captured["cmd"].index("-t") + 1])
+    tree = etree.parse(str(run_jmx))
+    assert [
+        _jmeter_property_value(node, "TransactionController.parent")
+        for node in tree.iter("TransactionController")
+    ] == ["true", "true"]
+    data_dir = Path(captured["cmd"][captured["cmd"].index("-o") + 1])
+    run_meta = json.loads((data_dir.parent / "run_meta.json").read_text(encoding="utf-8"))
+    assert run_meta["report_by_transaction"] is True
+    await jmeter_runner.wait_for_completion(case_id, timeout=10.0)
 
 
 @pytest.mark.asyncio

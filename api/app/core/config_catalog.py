@@ -50,6 +50,7 @@ CONFIG_META: dict[str, ConfigMeta] = {
     "SLAVE_JMETER_BIN_HOME": ConfigMeta("jmeter", "Slave JMeter执行目录", "path", 30),
     "SLAVE_JMETER_LOG_HOME": ConfigMeta("jmeter", "Slave JMeter日志目录", "path", 40),
     "MASTER_BASE_JMX_FILES_PATH": ConfigMeta("jmeter", "在线JMX基础脚本目录", "path", 50),
+    "JMETER_REPORT_BY_TRANSACTION": ConfigMeta("jmeter", "JMeter报告按事务聚合", "boolean", 60),
     "GRAFANA_DASHBOARD_URL": ConfigMeta("grafana", "Grafana完整面板地址", "url", 10),
     "GRAFANA_BASE_URL": ConfigMeta("grafana", "Grafana服务地址", "url", 20),
     "GRAFANA_DASHBOARD_PATH": ConfigMeta("grafana", "Grafana面板路径", "text", 30),
@@ -81,6 +82,7 @@ CONFIG_META: dict[str, ConfigMeta] = {
 }
 
 DEFAULT_CONFIG_VALUES: dict[str, str] = {
+    "JMETER_REPORT_BY_TRANSACTION": "true",
     "PROMETHEUS_STEP_SECONDS": "30",
     "PROMETHEUS_RESOURCE_GROUP_MAP": "{}",
     "REPORT_RUNNING_METRIC_REFRESH_SECONDS": "30",

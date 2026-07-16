@@ -8,7 +8,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import delete as sql_delete, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -115,7 +115,9 @@ def _parse_jtl_transaction_stats(jtl_path: str) -> list[dict]:
     groups: dict[str, dict] = {}
     total = {
         "name": "Total",
-        "elapsed": [],
+        "elapsed_sum": 0,
+        "max_elapsed": 0,
+        "min_elapsed": None,
         "failed": 0,
         "samples": 0,
         "start_ts": 0,
@@ -146,7 +148,9 @@ def _parse_jtl_transaction_stats(jtl_path: str) -> list[dict]:
                     label,
                     {
                         "name": label,
-                        "elapsed": [],
+                        "elapsed_sum": 0,
+                        "max_elapsed": 0,
+                        "min_elapsed": None,
                         "failed": 0,
                         "samples": 0,
                         "start_ts": 0,
@@ -154,7 +158,10 @@ def _parse_jtl_transaction_stats(jtl_path: str) -> list[dict]:
                     },
                 )
                 for target in (group, total):
-                    target["elapsed"].append(elapsed)
+                    target["elapsed_sum"] += elapsed
+                    target["max_elapsed"] = max(int(target["max_elapsed"] or 0), elapsed)
+                    min_elapsed = target["min_elapsed"]
+                    target["min_elapsed"] = elapsed if min_elapsed is None else min(min_elapsed, elapsed)
                     target["samples"] += 1
                     if not success:
                         target["failed"] += 1
@@ -164,7 +171,6 @@ def _parse_jtl_transaction_stats(jtl_path: str) -> list[dict]:
         return []
 
     def _to_row(target: dict) -> dict:
-        elapsed_values = target["elapsed"]
         samples = int(target["samples"] or 0)
         duration_sec = max((int(target["end_ts"] or 0) - int(target["start_ts"] or 0)) / 1000.0, 1.0)
         return {
@@ -172,9 +178,9 @@ def _parse_jtl_transaction_stats(jtl_path: str) -> list[dict]:
             "samples": samples,
             "failed": int(target["failed"] or 0),
             "tps": samples / duration_sec if samples else 0,
-            "avg_rt": (sum(elapsed_values) / samples) if samples else 0,
-            "max_rt": max(elapsed_values) if elapsed_values else 0,
-            "min_rt": min(elapsed_values) if elapsed_values else 0,
+            "avg_rt": (int(target["elapsed_sum"] or 0) / samples) if samples else 0,
+            "max_rt": int(target["max_elapsed"] or 0),
+            "min_rt": int(target["min_elapsed"] or 0),
         }
 
     rows = [_to_row(total)]
@@ -214,6 +220,9 @@ async def _list_transaction_snapshots(db: AsyncSession, report_id: int) -> list[
 
 async def _save_transaction_snapshots(db: AsyncSession, report_id: int, rows: list[dict]) -> None:
     now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    await db.execute(
+        sql_delete(ReportTransactionSnapshot).where(ReportTransactionSnapshot.report_id == report_id)
+    )
     for item in rows:
         values = {
             "report_id": report_id,
@@ -270,13 +279,13 @@ async def generate_transaction_snapshots_for_report(db: AsyncSession, report_id:
         raise MysteriousException(Codes.REPORT_NOT_EXIST)
 
     rows: list[dict] = []
-    statistics_path = _find_statistics_file(rpt.report_dir)
-    if statistics_path:
-        rows = await asyncio.to_thread(_parse_statistics_json_transactions, statistics_path)
+    jtl_path = _find_jtl_file(rpt.report_dir)
+    if jtl_path:
+        rows = await asyncio.to_thread(_parse_jtl_transaction_stats, jtl_path)
     if not rows:
-        jtl_path = _find_jtl_file(rpt.report_dir)
-        if jtl_path:
-            rows = await asyncio.to_thread(_parse_jtl_transaction_stats, jtl_path)
+        statistics_path = _find_statistics_file(rpt.report_dir)
+        if statistics_path:
+            rows = await asyncio.to_thread(_parse_statistics_json_transactions, statistics_path)
     if not rows:
         return 0
     await _save_transaction_snapshots(db, report_id, rows)
@@ -465,6 +474,12 @@ async def _save_transaction_metric_snapshots(
     metrics: list[dict],
 ) -> None:
     now = datetime.now(SHANGHAI).replace(tzinfo=None)
+    await db.execute(
+        sql_delete(ReportTransactionMetricSnapshot).where(
+            ReportTransactionMetricSnapshot.report_id == report_id,
+            ReportTransactionMetricSnapshot.window_sec == window_sec,
+        )
+    )
     for item in metrics:
         values = {
             "report_id": report_id,

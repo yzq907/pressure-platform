@@ -172,6 +172,19 @@ async def test_ensure_default_configs_adds_prometheus_step_to_config_list(
     assert item["displayName"] == "运行中报告指标刷新间隔秒"
     assert item["valueType"] == "number"
 
+    resp = await auth_client.get("/config/list?page=1&size=50&category=jmeter")
+    page = resp.json()["data"]
+    item = next(
+        config for config in page["list"] if config["configKey"] == "JMETER_REPORT_BY_TRANSACTION"
+    )
+
+    assert item["configValue"] == "true"
+    assert item["description"] == "JMeter报告按事务聚合"
+    assert item["category"] == "jmeter"
+    assert item["displayName"] == "JMeter报告按事务聚合"
+    assert item["valueType"] == "boolean"
+    assert all(config["configKey"] != "JMETER_SAVE_SUBRESULTS" for config in page["list"])
+
 
 @pytest.mark.asyncio
 async def test_ensure_default_configs_does_not_overwrite_existing_value(

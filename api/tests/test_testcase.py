@@ -55,6 +55,9 @@ async def test_add_testcase_name_with_space(
 ) -> None:
     resp = await auth_client.post("/testcase/add", json={"name": "bad name"})
     assert resp.json()["code"] == 1039  # TESTCASE_NAME_ERROR
+    assert "不能包含" in resp.json()["message"]
+    assert "空格" in resp.json()["message"]
+    assert "#" in resp.json()["message"]
 
 
 @pytest.mark.asyncio

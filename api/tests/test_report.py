@@ -22,6 +22,7 @@ from app.models.execution_run import ExecutionRun
 from app.models.report import Report
 from app.models.report_metric_snapshot import ReportMetricSnapshot
 from app.models.report_transaction_metric_snapshot import ReportTransactionMetricSnapshot
+from app.models.report_transaction_snapshot import ReportTransactionSnapshot
 from app.models.testcase import TestCase
 from app.services import report as report_service
 from app.services import report_metrics as report_metrics_service
@@ -115,6 +116,21 @@ async def test_report_list_filters_by_exec_type(auth_client: AsyncClient, db: As
 
 
 @pytest.mark.asyncio
+async def test_report_list_filters_by_status(auth_client: AsyncClient, db: AsyncSession) -> None:
+    await _insert_report(db, name="status_running", status=TestCaseStatus.RUN_ING.value)
+    await _insert_report(db, name="status_success", status=TestCaseStatus.RUN_SUCCESS.value)
+    await _insert_report(db, name="status_failed", status=TestCaseStatus.RUN_FAILED.value)
+
+    resp = await auth_client.get(
+        f"/report/list?page=1&size=10&status={TestCaseStatus.RUN_SUCCESS.value}"
+    )
+
+    page = resp.json()["data"]
+    assert page["total"] == 1
+    assert page["list"][0]["name"] == "status_success"
+
+
+@pytest.mark.asyncio
 async def test_report_list_by_test_case_filters_by_exec_type(
     auth_client: AsyncClient, db: AsyncSession
 ) -> None:
@@ -129,6 +145,38 @@ async def test_report_list_by_test_case_filters_by_exec_type(
     page = resp.json()["data"]
     assert page["total"] == 1
     assert page["list"][0]["name"] == "case_debug"
+
+
+@pytest.mark.asyncio
+async def test_report_list_by_test_case_filters_by_status(
+    auth_client: AsyncClient, db: AsyncSession
+) -> None:
+    await _insert_report(
+        db,
+        name="case_status_success",
+        test_case_id=88,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+    )
+    await _insert_report(
+        db,
+        name="case_status_failed",
+        test_case_id=88,
+        status=TestCaseStatus.RUN_FAILED.value,
+    )
+    await _insert_report(
+        db,
+        name="case_status_other",
+        test_case_id=99,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+    )
+
+    resp = await auth_client.get(
+        f"/report/listByTestCase?page=1&size=10&testCaseId=88&status={TestCaseStatus.RUN_FAILED.value}"
+    )
+
+    page = resp.json()["data"]
+    assert page["total"] == 1
+    assert page["list"][0]["name"] == "case_status_failed"
 
 
 @pytest.mark.asyncio
@@ -1148,6 +1196,103 @@ async def test_report_transaction_stats_fallbacks_to_jtl_grouped_by_label(
     assert data[1]["ratio"] == 66.67
     assert data[2]["samples"] == 1
     assert data[2]["ratio"] == 33.33
+
+
+@pytest.mark.asyncio
+async def test_report_transaction_stats_prefers_jtl_over_inconsistent_statistics_total(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-07-15-16:28:38"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (report_dir / "statistics.json").write_text(
+        json.dumps(
+            {
+                "Total": {"transaction": "Total", "sampleCount": 59, "errorCount": 0},
+                "LDAP事务": {
+                    "transaction": "LDAP事务",
+                    "sampleCount": 3,
+                    "errorCount": 0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads,responseMessage",
+                '1700000000000,30,LDAP事务,true,1,1,"Number of samples in transaction : 2"',
+                '1700000000030,40,LDAP事务,true,1,1,"Number of samples in transaction : 2"',
+                '1700000000070,50,LDAP事务,true,1,1,"Number of samples in transaction : 2"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-jtl-source-of-truth",
+        exec_type=ExecType.EXEC.value,
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+
+    resp = await auth_client.get(f"/report/transactionStats/{rid}")
+    data = resp.json()["data"]
+
+    assert [item["name"] for item in data] == ["Total", "LDAP事务"]
+    assert data[0]["samples"] == 3
+    assert data[0]["success"] == 3
+    assert data[0]["ratio"] == 100.0
+    assert data[1]["samples"] == 3
+    assert data[1]["ratio"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_generate_transaction_snapshots_removes_stale_labels(
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "2026-07-15-17:00:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,label,success,allThreads,grpThreads",
+                "1700000000000,30,父事务,true,1,1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    rid = await _insert_report(db, name="transaction-stale-label", report_dir=str(report_dir))
+    db.add(
+        ReportTransactionSnapshot(
+            report_id=rid,
+            transaction_name="旧子请求",
+            samples=99,
+            creator="system",
+            creator_id="0",
+            modifier="system",
+            modifier_id="0",
+        )
+    )
+    await db.commit()
+
+    await report_service.generate_transaction_snapshots_for_report(db, rid)
+
+    rows = (
+        await db.execute(
+            select(ReportTransactionSnapshot).where(ReportTransactionSnapshot.report_id == rid)
+        )
+    ).scalars().all()
+    assert {row.transaction_name for row in rows} == {"Total", "父事务"}
 
 
 @pytest.mark.asyncio

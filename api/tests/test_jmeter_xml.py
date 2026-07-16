@@ -333,6 +333,22 @@ def test_list_transactions_returns_transaction_controllers_with_thread_group(tmp
     ]
 
 
+def test_enable_transaction_parent_samples_updates_enabled_controllers_only(tmp_path: Path) -> None:
+    jmx = tmp_path / "transactions.jmx"
+    _write_transaction_sample(jmx)
+    tree = etree.parse(str(jmx))
+    enabled, disabled = list(tree.iter("TransactionController"))
+    enabled.find("./boolProp[@name='TransactionController.parent']").text = "false"
+    tree.write(str(jmx), xml_declaration=True, encoding="UTF-8")
+
+    jmeter_xml.enable_transaction_parent_samples(str(jmx))
+
+    tree = etree.parse(str(jmx))
+    enabled, disabled = list(tree.iter("TransactionController"))
+    assert _jmeter_property_value(enabled, "TransactionController.parent") == "true"
+    assert _jmeter_property_value(disabled, "TransactionController.parent") is None
+
+
 def test_list_transactions_falls_back_to_thread_groups_when_no_transaction_controller(tmp_path: Path) -> None:
     jmx = tmp_path / "thread_group_transactions.jmx"
     _write_thread_group_transaction_sample(jmx)

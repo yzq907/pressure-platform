@@ -141,7 +141,13 @@ async def get_by_id(db: AsyncSession, id: int) -> ReportVO | None:
 
 async def get_report_list(db: AsyncSession, query: ReportQuery) -> PageVO[ReportVO]:
     page_vo: PageVO[ReportVO] = PageVO(page=query.page, size=query.size, total=0, list=[])
-    total = await crud.count(db, name=query.name, region=query.region, exec_type=query.exec_type)
+    total = await crud.count(
+        db,
+        name=query.name,
+        region=query.region,
+        exec_type=query.exec_type,
+        status=query.status,
+    )
     if total <= 0:
         return page_vo
     page_vo.total = total
@@ -151,6 +157,7 @@ async def get_report_list(db: AsyncSession, query: ReportQuery) -> PageVO[Report
         name=query.name,
         region=query.region,
         exec_type=query.exec_type,
+        status=query.status,
         offset=offset,
         limit=query.size,
     )
@@ -167,6 +174,7 @@ async def get_report_list_by_test_case(
         name=query.name,
         test_case_id=query.test_case_id,
         exec_type=query.exec_type,
+        status=query.status,
     )
     if total <= 0:
         return page_vo
@@ -177,6 +185,7 @@ async def get_report_list_by_test_case(
         name=query.name,
         test_case_id=query.test_case_id,
         exec_type=query.exec_type,
+        status=query.status,
         offset=offset,
         limit=query.size,
     )

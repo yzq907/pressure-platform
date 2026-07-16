@@ -22,6 +22,7 @@ from app.core.jmeter_pacing import apply_thread_group_pacing
 from app.core.jmeter_thread_groups import (
     CONCURRENCY_TG as _CONCURRENCY_TG,
     STEPPING_TG as _STEPPING_TG,
+    enable_transaction_parent_samples,
     list_thread_groups,
     list_transactions,
     sum_enabled_thread_group_threads,

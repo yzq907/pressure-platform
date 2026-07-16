@@ -1,1 +1,0 @@
-import{s as t}from"./request.10c02228.js";const s=e=>t({url:"/role/add",method:"post",data:e}),a=(e,o)=>t({url:"/role/update/"+e,method:"post",data:o}),l=e=>t({url:"/role/delete/"+e,method:"get"}),d=e=>t({url:"/role/list",method:"get",params:e}),u=()=>t({url:"/role/permissions",method:"get"});export{u as a,s as b,l as d,d as g,a as u};
