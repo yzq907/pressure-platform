@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import json
+import os
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
@@ -24,9 +24,11 @@ from app.models.report_metric_snapshot import ReportMetricSnapshot
 from app.models.report_transaction_metric_snapshot import ReportTransactionMetricSnapshot
 from app.models.report_transaction_snapshot import ReportTransactionSnapshot
 from app.models.testcase import TestCase
-from app.services import report as report_service
-from app.services import report_metrics as report_metrics_service
 from app.services import prometheus as prometheus_service
+from app.services import report as report_service
+from app.services import report_error_samples as report_error_samples_service
+from app.services import report_metrics as report_metrics_service
+from app.services import report_transactions as report_transactions_service
 from app.services.report import _parse_jtl_metrics
 
 
@@ -406,6 +408,7 @@ async def test_report_error_samples_backfills_missing_error_types_from_jtl(
         report_dir=str(report_root / "data") + os.sep,
         artifact_dir=str(artifact_dir),
     )
+    await report_service.generate_error_samples_snapshot_for_report(db, rid)
 
     resp = await auth_client.get(f"/report/errorSamples/{rid}")
 
@@ -417,6 +420,82 @@ async def test_report_error_samples_backfills_missing_error_types_from_jtl(
     assert labels["5_资源下载"]["errorType"] == "404"
     assert labels["5_资源下载"]["requestUrl"] == "https://example.test/download"
     assert labels["6_获取设备信息"]["errorType"] == "ASSERTION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_report_error_samples_missing_snapshot_never_scans_jtl_on_request(
+    auth_client: AsyncClient,
+    db: AsyncSession,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    report_root = tmp_path / "report" / "2026-07-18-15:30:00"
+    artifact_dir = report_root / "artifacts"
+    jtl_dir = report_root / "jtl"
+    artifact_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "timeStamp,elapsed,label,success\n1700000000000,10,ok,true\n",
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="error-samples-nonblocking",
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_root / "data") + os.sep,
+        artifact_dir=str(artifact_dir),
+    )
+    scheduled: list[int] = []
+
+    def fail_scan(*args, **kwargs):
+        raise AssertionError("error sample request must not scan JTL")
+
+    def fake_schedule(report_id: int) -> bool:
+        scheduled.append(report_id)
+        return True
+
+    monkeypatch.setattr(
+        report_error_samples_service,
+        "schedule_error_sample_snapshot_generation",
+        fake_schedule,
+        raising=False,
+    )
+    monkeypatch.setattr("app.services.report_error_samples._append_jtl_backfill_samples", fail_scan)
+
+    resp = await auth_client.get(f"/report/errorSamples/{rid}")
+
+    assert resp.json()["data"] == {"reportId": rid, "total": 0, "groups": {}, "list": []}
+    assert scheduled == [rid]
+
+
+@pytest.mark.asyncio
+async def test_generate_error_sample_snapshot_persists_empty_result(
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "report" / "2026-07-18-15:31:00"
+    artifact_dir = report_root / "artifacts"
+    jtl_dir = report_root / "jtl"
+    artifact_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "timeStamp,elapsed,label,success\n1700000000000,10,ok,true\n",
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="error-samples-empty-snapshot",
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_root / "data") + os.sep,
+        artifact_dir=str(artifact_dir),
+    )
+
+    count = await report_service.generate_error_samples_snapshot_for_report(db, rid)
+
+    snapshot = report_root / "_internal" / "error_samples" / "error_samples.snapshot.json"
+    assert count == 0
+    assert snapshot.is_file()
+    assert json.loads(snapshot.read_text(encoding="utf-8"))["complete"] is True
 
 
 @pytest.mark.asyncio
@@ -1108,6 +1187,7 @@ async def test_report_transaction_stats_reads_jmeter_statistics_json(
         status=TestCaseStatus.RUN_SUCCESS.value,
         report_dir=str(report_dir),
     )
+    await report_service.generate_transaction_snapshots_for_report(db, rid)
 
     resp = await auth_client.get(f"/report/transactionStats/{rid}")
     body = resp.json()
@@ -1182,6 +1262,7 @@ async def test_report_transaction_stats_fallbacks_to_jtl_grouped_by_label(
         status=TestCaseStatus.RUN_SUCCESS.value,
         report_dir=str(report_dir),
     )
+    await report_service.generate_transaction_snapshots_for_report(db, rid)
 
     resp = await auth_client.get(f"/report/transactionStats/{rid}")
     data = resp.json()["data"]
@@ -1240,6 +1321,7 @@ async def test_report_transaction_stats_prefers_jtl_over_inconsistent_statistics
         status=TestCaseStatus.RUN_SUCCESS.value,
         report_dir=str(report_dir),
     )
+    await report_service.generate_transaction_snapshots_for_report(db, rid)
 
     resp = await auth_client.get(f"/report/transactionStats/{rid}")
     data = resp.json()["data"]
@@ -1296,6 +1378,49 @@ async def test_generate_transaction_snapshots_removes_stale_labels(
 
 
 @pytest.mark.asyncio
+async def test_transaction_detail_endpoints_schedule_missing_snapshots_without_parsing_request(
+    db: AsyncSession,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    report_root = tmp_path / "2026-07-18-15:40:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "timeStamp,elapsed,label,success,allThreads,grpThreads\n"
+        "1700000000000,100,login,true,1,1\n",
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-details-nonblocking",
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+    scheduled: list[tuple[str, int, tuple[int, ...]]] = []
+
+    monkeypatch.setattr(
+        report_transactions_service,
+        "schedule_transaction_snapshot_generation",
+        lambda report_id: scheduled.append(("stats", report_id, ())),
+    )
+    monkeypatch.setattr(
+        report_transactions_service,
+        "schedule_transaction_metric_snapshot_generation",
+        lambda report_id, windows=(60,): scheduled.append(("metrics", report_id, tuple(windows))),
+    )
+
+    stats = await report_service.get_transaction_stats(db, rid)
+    metrics = await report_service.get_transaction_metrics(db, rid, 60)
+
+    assert stats == []
+    assert metrics.transactions == []
+    assert scheduled == [("stats", rid, ()), ("metrics", rid, (60,))]
+
+
+@pytest.mark.asyncio
 async def test_report_transaction_metrics_groups_jtl_by_label_and_time_window(
     auth_client: AsyncClient,
     db: AsyncSession,
@@ -1326,6 +1451,7 @@ async def test_report_transaction_metrics_groups_jtl_by_label_and_time_window(
         status=TestCaseStatus.RUN_SUCCESS.value,
         report_dir=str(report_dir),
     )
+    await report_service.generate_transaction_metric_snapshots_for_report(db, rid, (60,))
 
     resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
     body = resp.json()
@@ -1401,6 +1527,7 @@ async def test_report_transaction_metrics_prefers_group_threads_without_thread_n
         status=TestCaseStatus.RUN_SUCCESS.value,
         report_dir=str(report_dir),
     )
+    await report_service.generate_transaction_metric_snapshots_for_report(db, rid, (60,))
 
     resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
     body = resp.json()
@@ -1439,6 +1566,7 @@ async def test_report_transaction_metrics_fallbacks_to_all_threads_when_group_th
         status=TestCaseStatus.RUN_SUCCESS.value,
         report_dir=str(report_dir),
     )
+    await report_service.generate_transaction_metric_snapshots_for_report(db, rid, (60,))
 
     resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
     body = resp.json()
@@ -1488,6 +1616,7 @@ async def test_report_transaction_metrics_regenerates_zero_active_thread_snapsho
         )
     )
     await db.commit()
+    await report_service.generate_transaction_metric_snapshots_for_report(db, rid, (60,))
 
     resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
     body = resp.json()
@@ -1538,6 +1667,7 @@ async def test_report_transaction_metrics_regenerates_legacy_all_threads_snapsho
         )
     )
     await db.commit()
+    await report_service.generate_transaction_metric_snapshots_for_report(db, rid, (60,))
 
     resp = await auth_client.get(f"/report/transactionMetrics/{rid}?window=60")
     body = resp.json()
@@ -1577,6 +1707,7 @@ async def test_report_transaction_trend_returns_split_chart_data(
         status=TestCaseStatus.RUN_SUCCESS.value,
         report_dir=str(report_dir),
     )
+    await report_service.generate_transaction_metric_snapshots_for_report(db, rid, (60,))
 
     resp = await auth_client.get(f"/report/transactionTrend/{rid}?window=60")
     body = resp.json()
@@ -1595,6 +1726,41 @@ async def test_report_transaction_trend_returns_split_chart_data(
     assert data["avgRt"]["login"][0] == {"timestamp": "06:13:00", "value": 200.0}
     assert data["activeThreads"]["login"][0] == {"timestamp": "06:13:00", "value": 2}
     assert data["activeThreads"]["query"][0] == {"timestamp": "06:13:00", "value": 1}
+
+
+@pytest.mark.asyncio
+async def test_transaction_trend_does_not_generate_overall_metrics_when_transaction_snapshot_exists(
+    db: AsyncSession,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    report_root = tmp_path / "2026-07-18-15:32:00"
+    report_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    report_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    (jtl_dir / "result.jtl").write_text(
+        "timeStamp,elapsed,label,success,allThreads,grpThreads\n"
+        "1700000000000,100,login,true,1,1\n",
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="transaction-trend-no-overall-parse",
+        status=TestCaseStatus.RUN_SUCCESS.value,
+        report_dir=str(report_dir),
+    )
+    await report_service.generate_transaction_metric_snapshots_for_report(db, rid, (60,))
+
+    def fail_generate(*args, **kwargs):
+        raise AssertionError("transaction trend must not generate overall metrics")
+
+    monkeypatch.setattr(report_transactions_service, "schedule_metric_snapshot_generation", fail_generate)
+
+    trend = await report_service.get_transaction_trend(db, rid, 60)
+
+    assert trend.transactions == ["login"]
+    assert trend.total_tps[0].value == 0.02
 
 
 @pytest.mark.asyncio
@@ -1896,6 +2062,106 @@ def test_parse_jtl_metrics_keeps_single_machine_threads(tmp_path) -> None:
     assert items[0]["threads"] == 15
 
 
+def test_parse_jtl_metrics_skips_incomplete_csv_row(tmp_path) -> None:
+    jtl = tmp_path / "result.jtl"
+    jtl.write_text(
+        "\n".join(
+            [
+                "timeStamp,elapsed,success,allThreads,grpThreads",
+                "1700000000000,100,true,10,10",
+                "1700000001000,120",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    items = _parse_jtl_metrics(str(jtl), 5)
+
+    assert len(items) == 1
+    assert items[0]["sample_count"] == 1
+
+
+def test_parse_incremental_jtl_metrics_only_consumes_appended_complete_rows(tmp_path) -> None:
+    jtl = tmp_path / "result.jtl"
+    jtl.write_bytes(
+        b"timeStamp,elapsed,success,allThreads,grpThreads\n"
+        b"1700000000000,100,true,10,10\n"
+        b"1700000001000,200"
+    )
+    state = report_metrics_service._IncrementalMetricState(str(jtl), 5)
+
+    first = report_metrics_service._parse_incremental_jtl_metrics(state, {})
+
+    assert len(first) == 1
+    assert first[0]["sample_count"] == 1
+    assert first[0]["avg_rt"] == 100.0
+    report_metrics_service._ack_incremental_jtl_metrics(state, first)
+
+    with jtl.open("ab") as f:
+        f.write(b",false,12,12\n")
+
+    second = report_metrics_service._parse_incremental_jtl_metrics(state, {})
+
+    assert len(second) == 1
+    assert second[0]["sample_count"] == 2
+    assert second[0]["avg_rt"] == 150.0
+    assert second[0]["error_rate"] == 50.0
+    assert second[0]["threads"] == 12
+    report_metrics_service._ack_incremental_jtl_metrics(state, second)
+    assert report_metrics_service._parse_incremental_jtl_metrics(state, {}) == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_running_metric_snapshots_advances_with_appended_jtl_rows(
+    db: AsyncSession,
+    tmp_path,
+) -> None:
+    report_root = tmp_path / "report" / "2026-06-01-14:50:00"
+    data_dir = report_root / "data"
+    jtl_dir = report_root / "jtl"
+    data_dir.mkdir(parents=True)
+    jtl_dir.mkdir()
+    jtl = jtl_dir / "result.jtl"
+    jtl.write_text(
+        "timeStamp,elapsed,success,allThreads,grpThreads\n"
+        "1780296600000,100,true,10,10\n",
+        encoding="utf-8",
+    )
+    rid = await _insert_report(
+        db,
+        name="running_incremental",
+        status=TestCaseStatus.RUN_ING.value,
+        report_dir=str(data_dir) + os.sep,
+    )
+
+    first_count, is_running, _ = await report_metrics_service._refresh_running_metric_snapshots(
+        rid,
+        (5,),
+        str(jtl),
+    )
+    with jtl.open("a", encoding="utf-8") as output:
+        output.write("1780296720000,120,true,12,12\n")
+    second_count, _, _ = await report_metrics_service._refresh_running_metric_snapshots(
+        rid,
+        (5,),
+        str(jtl),
+    )
+
+    await db.rollback()
+    snapshots = (
+        await db.execute(
+            select(ReportMetricSnapshot)
+            .where(ReportMetricSnapshot.report_id == rid)
+            .order_by(ReportMetricSnapshot.bucket_start_ms)
+        )
+    ).scalars().all()
+    assert first_count == 1
+    assert second_count == 1
+    assert is_running is True
+    assert [item.bucket_start_ms for item in snapshots] == [1780296600000, 1780296720000]
+    await report_metrics_service.stop_running_metric_snapshot_generation(rid)
+
+
 @pytest.mark.asyncio
 async def test_get_jtl_metrics_persists_snapshot_and_reuses_it(
     db: AsyncSession,
@@ -1979,8 +2245,7 @@ async def test_get_jtl_metrics_refreshes_running_report_snapshot(
         scheduled.append((report_id, tuple(windows)))
         return True
 
-    monkeypatch.setattr(report_metrics_service, "schedule_metric_snapshot_generation", fake_schedule)
-    monkeypatch.setattr(report_metrics_service, "_metric_snapshot_last_refresh", {}, raising=False)
+    monkeypatch.setattr(report_metrics_service, "schedule_running_metric_snapshot_generation", fake_schedule)
 
     items = await report_service.get_jtl_metrics(db, rid, 5)
 
@@ -1989,48 +2254,13 @@ async def test_get_jtl_metrics_refreshes_running_report_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_get_jtl_metrics_uses_configured_running_refresh_interval(
+async def test_running_metric_tracker_uses_configured_refresh_interval(
     db: AsyncSession,
-    tmp_path,
-    monkeypatch,
 ) -> None:
-    db.add(Config(config_key="REPORT_RUNNING_METRIC_REFRESH_SECONDS", config_value="30"))
-    report_root = tmp_path / "report" / "2026-06-01-16:03:00"
-    data_dir = report_root / "data"
-    data_dir.mkdir(parents=True)
-    rid = await _insert_report(
-        db,
-        name="snapshot_running_config_interval",
-        status=TestCaseStatus.RUN_ING.value,
-        report_dir=str(data_dir) + os.sep,
-    )
-    db.add(
-        ReportMetricSnapshot(
-            report_id=rid,
-            window_sec=5,
-            bucket_start_ms=1700000000000,
-            timestamp="10:00:00",
-            qps=1.0,
-        )
-    )
+    db.add(Config(config_key="REPORT_RUNNING_METRIC_REFRESH_SECONDS", config_value="5"))
     await db.commit()
 
-    scheduled: list[tuple[int, tuple[int, ...]]] = []
-
-    def fake_schedule(report_id: int, windows=(5,)) -> bool:
-        scheduled.append((report_id, tuple(windows)))
-        return True
-
-    monkeypatch.setattr(report_metrics_service, "schedule_metric_snapshot_generation", fake_schedule)
-    monkeypatch.setattr(report_metrics_service, "_metric_snapshot_last_refresh", {}, raising=False)
-
-    report_metrics_service._metric_snapshot_last_refresh[(rid, 5)] = report_metrics_service.time.monotonic() - 11
-    await report_service.get_jtl_metrics(db, rid, 5)
-    assert scheduled == []
-
-    report_metrics_service._metric_snapshot_last_refresh[(rid, 5)] = report_metrics_service.time.monotonic() - 31
-    await report_service.get_jtl_metrics(db, rid, 5)
-    assert scheduled == [(rid, (5,))]
+    assert await report_metrics_service._running_metric_refresh_seconds(db) == 5.0
 
 
 @pytest.mark.asyncio
@@ -2075,9 +2305,10 @@ async def test_get_jtl_metrics_does_not_refresh_finished_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_get_jtl_metrics_returns_running_jtl_when_snapshot_missing(
+async def test_get_jtl_metrics_schedules_running_tracker_when_snapshot_missing(
     db: AsyncSession,
     tmp_path,
+    monkeypatch,
 ) -> None:
     report_root = tmp_path / "report" / "2026-06-01-17:00:00"
     data_dir = report_root / "data"
@@ -2101,11 +2332,27 @@ async def test_get_jtl_metrics_returns_running_jtl_when_snapshot_missing(
         report_dir=str(data_dir) + os.sep,
     )
 
+    scheduled: list[tuple[int, tuple[int, ...]]] = []
+
+    def fake_schedule(report_id: int, windows=(5,)) -> bool:
+        scheduled.append((report_id, tuple(windows)))
+        return True
+
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("request path should not parse a running JTL")
+
+    monkeypatch.setattr(
+        report_metrics_service,
+        "schedule_running_metric_snapshot_generation",
+        fake_schedule,
+        raising=False,
+    )
+    monkeypatch.setattr(report_metrics_service, "_parse_jtl_metrics", fail_parse)
+
     items = await report_service.get_jtl_metrics(db, rid, 5)
 
-    assert len(items) == 1
-    assert items[0]["qps"] == 0.4
-    assert items[0]["threads"] == 12
+    assert items == []
+    assert scheduled == [(rid, (5,))]
     snapshots = (
         await db.execute(
             select(ReportMetricSnapshot).where(
@@ -2114,7 +2361,7 @@ async def test_get_jtl_metrics_returns_running_jtl_when_snapshot_missing(
             )
         )
     ).scalars().all()
-    assert len(snapshots) == 1
+    assert snapshots == []
 
 
 @pytest.mark.asyncio

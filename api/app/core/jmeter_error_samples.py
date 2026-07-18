@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 from lxml import etree
 
 from app.core.jmeter_thread_groups import walk_jmeter_pairs
 from app.core.jmeter_xml_support import parse_jmx, write_jmx
 
-
 ERROR_SAMPLE_FILENAME = "error_samples.jsonl"
 ERROR_SAMPLE_XML_FILENAME = "error_samples.xml"
+ERROR_SAMPLE_SNAPSHOT_FILENAME = "error_samples.snapshot.json"
 ERROR_SAMPLE_INTERNAL_DIRNAME = "_internal/error_samples"
 ERROR_SAMPLE_FILE_PROP = "platform.errorSampleFile"
 ERROR_SAMPLE_PER_CODE_LIMIT_PROP = "platform.errorSamplePerCodeLimit"

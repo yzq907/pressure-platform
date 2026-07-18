@@ -40,10 +40,42 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def test_schedule_metric_snapshot_includes_error_sample_snapshot(monkeypatch) -> None:
+    calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        "app.services.report.schedule_metric_snapshot_generation",
+        lambda report_id: calls.append(("metric", report_id)),
+    )
+    monkeypatch.setattr(
+        "app.services.report.schedule_transaction_snapshot_generation",
+        lambda report_id: calls.append(("transaction", report_id)),
+    )
+    monkeypatch.setattr(
+        "app.services.report.schedule_transaction_metric_snapshot_generation",
+        lambda report_id: calls.append(("transaction_metric", report_id)),
+    )
+    monkeypatch.setattr(
+        "app.services.report.schedule_error_sample_snapshot_generation",
+        lambda report_id: calls.append(("error", report_id)),
+        raising=False,
+    )
+
+    jmeter_runner._schedule_metric_snapshot(17)
+
+    assert calls == [
+        ("metric", 17),
+        ("transaction", 17),
+        ("transaction_metric", 17),
+        ("error", 17),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_launch_jmeter_persists_execution_run_lifecycle(
     tmp_path: Path,
     db: AsyncSession,
+    monkeypatch,
 ) -> None:
     script = tmp_path / "fake_jmeter.sh"
     script.write_text("#!/bin/bash\nsleep 0.4\necho done\n", encoding="utf-8")
@@ -62,6 +94,27 @@ async def test_launch_jmeter_persists_execution_run_lifecycle(
     await db.commit()
     testcase_id = tc.id
     report_id = rpt.id
+    metric_tracking_calls: list[tuple[str, int, str | None]] = []
+
+    def fake_start_metric_tracking(tracked_report_id: int, jtl_path: str | None) -> bool:
+        metric_tracking_calls.append(("start", tracked_report_id, jtl_path))
+        return True
+
+    async def fake_stop_metric_tracking(tracked_report_id: int) -> None:
+        metric_tracking_calls.append(("stop", tracked_report_id, None))
+
+    monkeypatch.setattr(
+        jmeter_runner,
+        "_start_realtime_metric_tracking",
+        fake_start_metric_tracking,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        jmeter_runner,
+        "_stop_realtime_metric_tracking",
+        fake_stop_metric_tracking,
+        raising=False,
+    )
 
     await jmeter_runner.launch_jmeter(
         [str(script)],
@@ -87,6 +140,10 @@ async def test_launch_jmeter_persists_execution_run_lifecycle(
     assert running.finished_at is not None
     await db.refresh(rpt)
     assert rpt.modify_time > old_report_time
+    assert metric_tracking_calls == [
+        ("start", report_id, str(tmp_path / "result.jtl")),
+        ("stop", report_id, None),
+    ]
 
 
 @pytest.mark.asyncio

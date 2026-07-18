@@ -23,22 +23,21 @@ import subprocess
 import time
 from asyncio.subprocess import PIPE, Process
 from datetime import datetime
-from pathlib import Path
 
 from lxml import etree
 from sqlalchemy import select
 
+from app.core.enums import ExecType, TestCaseStatus
 from app.core.jmeter_error_samples import (
     ERROR_SAMPLE_FILENAME,
     ERROR_SAMPLE_XML_FILENAME,
     error_sample_dir_from_artifact_dir,
 )
 from app.core.ssh import SSHClient
-from app.core.enums import ExecType, TestCaseStatus
 from app.db import session as session_module
 from app.models.execution_node import ExecutionNode
-from app.models.node import Node
 from app.models.execution_run import ExecutionRun
+from app.models.node import Node
 from app.models.report import Report
 from app.models.testcase import TestCase
 
@@ -565,6 +564,7 @@ async def _run_and_callback(
     exit_code = -1
     proc = None
     heartbeat_task: asyncio.Task | None = None
+    realtime_metric_tracking_enabled = exec_type == ExecType.EXEC.value
     started_at = time.monotonic()
     try:
         log.info(
@@ -582,6 +582,8 @@ async def _run_and_callback(
         )
         _running_processes[report_id] = proc
         await _mark_execution_run_running(report_id, proc)
+        if realtime_metric_tracking_enabled:
+            _start_realtime_metric_tracking(report_id, jtl_path)
         heartbeat_task = asyncio.create_task(
             _heartbeat_execution_run(report_id),
             name=f"jmeter-heartbeat-{report_id}",
@@ -638,6 +640,8 @@ async def _run_and_callback(
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
+        if realtime_metric_tracking_enabled:
+            await _stop_realtime_metric_tracking(report_id)
 
     # proc.kill() 会导致进程被杀→ returncode < 0，视为失败
     if exit_code < 0:
@@ -742,6 +746,19 @@ def _schedule_metric_snapshot(report_id: int) -> None:
     report_service.schedule_metric_snapshot_generation(report_id)
     report_service.schedule_transaction_snapshot_generation(report_id)
     report_service.schedule_transaction_metric_snapshot_generation(report_id)
+    report_service.schedule_error_sample_snapshot_generation(report_id)
+
+
+def _start_realtime_metric_tracking(report_id: int, jtl_path: str | None) -> bool:
+    from app.services import report_metrics
+
+    return report_metrics.schedule_running_metric_snapshot_generation(report_id, jtl_path=jtl_path)
+
+
+async def _stop_realtime_metric_tracking(report_id: int) -> None:
+    from app.services import report_metrics
+
+    await report_metrics.stop_running_metric_snapshot_generation(report_id)
 
 
 def _tail_for_log(value: str, limit: int = _LOG_TAIL_LIMIT) -> str:

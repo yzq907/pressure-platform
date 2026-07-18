@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import csv
 import json
 import logging
 import os
 import re
-import csv
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -16,12 +17,14 @@ from lxml import etree
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.codes import Codes
+from app.core.enums import TestCaseStatus
 from app.core.exceptions import MysteriousException
 from app.core.jmeter_error_samples import (
     DEFAULT_ERROR_SAMPLE_PER_CODE_LIMIT,
     DEFAULT_ERROR_SAMPLE_TEXT_MAX_BYTES,
     DEFAULT_ERROR_SAMPLE_TOTAL_LIMIT,
     ERROR_SAMPLE_FILENAME,
+    ERROR_SAMPLE_SNAPSHOT_FILENAME,
     ERROR_SAMPLE_XML_FILENAME,
     error_sample_dir_from_artifact_dir,
 )
@@ -29,8 +32,8 @@ from app.crud import report as report_crud
 from app.models.report import Report
 from app.schemas.report import ErrorSamplesVO, ErrorSampleVO
 
-
 log = logging.getLogger(__name__)
+_error_sample_snapshot_tasks: set[int] = set()
 
 _SENSITIVE_LINE_RE = re.compile(
     r"(?im)^([^:\r\n]*(authorization|cookie|token|password|secret)[^:\r\n]*\s*:\s*).+$"
@@ -54,6 +57,13 @@ def _error_sample_paths(report: Report) -> list[Path]:
         return []
     path = error_sample_dir_from_artifact_dir(artifact_dir) / ERROR_SAMPLE_FILENAME
     return [path] if path.is_file() else []
+
+
+def _error_sample_snapshot_path(report: Report) -> Path | None:
+    artifact_dir = _report_artifact_dir(report)
+    if not artifact_dir:
+        return None
+    return error_sample_dir_from_artifact_dir(artifact_dir) / ERROR_SAMPLE_SNAPSHOT_FILENAME
 
 
 def _report_base_dir(report: Report) -> Path | None:
@@ -352,11 +362,7 @@ def _append_jtl_backfill_samples(report: Report, samples: list[ErrorSampleVO], l
             log.warning("读取 JTL 兜底错误样本失败: %s", e)
 
 
-async def get_error_samples(db: AsyncSession, report_id: int, limit: int = 100) -> ErrorSamplesVO:
-    report = await report_crud.get_by_id(db, report_id)
-    if report is None:
-        raise MysteriousException(Codes.REPORT_NOT_EXIST)
-
+def _collect_error_samples(report: Report, limit: int, *, include_jtl: bool) -> ErrorSamplesVO:
     samples: list[ErrorSampleVO] = []
     seen: set[tuple[int, str, str, str]] = set()
     for path in _error_sample_paths(report):
@@ -367,7 +373,105 @@ async def get_error_samples(db: AsyncSession, report_id: int, limit: int = 100) 
             seen.add(key)
             samples.append(sample)
     _append_xml_error_samples(report, samples, limit)
-    _append_jtl_backfill_samples(report, samples, limit)
+    if include_jtl:
+        _append_jtl_backfill_samples(report, samples, limit)
     result = _build_error_samples_vo(samples, limit)
-    result.report_id = report_id
+    result.report_id = report.id
+    return result
+
+
+def _write_error_sample_snapshot(report: Report, result: ErrorSamplesVO) -> None:
+    path = _error_sample_snapshot_path(report)
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    payload = {
+        "complete": True,
+        "data": result.model_dump(mode="json", by_alias=False),
+    }
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _read_error_sample_snapshot(report: Report, limit: int) -> ErrorSamplesVO | None:
+    path = _error_sample_snapshot_path(report)
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("complete") is not True:
+            return None
+        result = ErrorSamplesVO.model_validate(payload.get("data") or {})
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        log.warning("读取错误样本快照失败: %s", exc)
+        return None
+    max_items = max(1, min(int(limit or 100), 1000))
+    result.list = result.list[:max_items]
+    return result
+
+
+async def generate_error_samples_snapshot_for_report(
+    db: AsyncSession,
+    report_id: int,
+    limit: int = DEFAULT_ERROR_SAMPLE_TOTAL_LIMIT,
+) -> int:
+    report = await report_crud.get_by_id(db, report_id)
+    if report is None:
+        raise MysteriousException(Codes.REPORT_NOT_EXIST)
+    result = await asyncio.to_thread(_collect_error_samples, report, limit, include_jtl=True)
+    await asyncio.to_thread(_write_error_sample_snapshot, report, result)
+    return result.total
+
+
+async def _generate_error_sample_snapshot_background(report_id: int) -> None:
+    from app.db import session as session_module
+
+    async with session_module.AsyncSessionLocal() as db:
+        count = await generate_error_samples_snapshot_for_report(db, report_id)
+    log.info("报告错误样本快照生成完成: report_id=%s rows=%s", report_id, count)
+
+
+def _on_error_sample_snapshot_task_done(report_id: int, task: asyncio.Task) -> None:
+    _error_sample_snapshot_tasks.discard(report_id)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        log.warning(
+            "报告错误样本快照生成失败: report_id=%s",
+            report_id,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
+def schedule_error_sample_snapshot_generation(report_id: int) -> bool:
+    if report_id in _error_sample_snapshot_tasks:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    _error_sample_snapshot_tasks.add(report_id)
+    task = loop.create_task(
+        _generate_error_sample_snapshot_background(report_id),
+        name=f"report-error-sample-snapshot-{report_id}",
+    )
+    task.add_done_callback(lambda done_task: _on_error_sample_snapshot_task_done(report_id, done_task))
+    return True
+
+
+async def get_error_samples(db: AsyncSession, report_id: int, limit: int = 100) -> ErrorSamplesVO:
+    report = await report_crud.get_by_id(db, report_id)
+    if report is None:
+        raise MysteriousException(Codes.REPORT_NOT_EXIST)
+
+    result = await asyncio.to_thread(_read_error_sample_snapshot, report, limit)
+    if result is not None:
+        return result
+
+    result = await asyncio.to_thread(_collect_error_samples, report, limit, include_jtl=False)
+    if report.status != TestCaseStatus.RUN_ING.value:
+        schedule_error_sample_snapshot_generation(report_id)
     return result

@@ -50,11 +50,15 @@ from app.services.prometheus import (
     get_resource_targets,
     resolve_grafana_instance,
 )
+from app.services.report_error_samples import (
+    generate_error_samples_snapshot_for_report,
+    get_error_samples,
+    schedule_error_sample_snapshot_generation,
+)
 from app.services.report_metrics import (
     DEFAULT_METRIC_WINDOWS,
     _find_jtl_file,
     _load_run_meta,
-    _metric_snapshot_last_refresh,
     _normalize_to_relative,
     _parse_jtl_metrics,
     compare_reports,
@@ -62,7 +66,6 @@ from app.services.report_metrics import (
     get_jtl_metrics,
     schedule_metric_snapshot_generation,
 )
-from app.services.report_error_samples import get_error_samples
 from app.services.report_transactions import (
     generate_transaction_metric_snapshots_for_report,
     generate_transaction_snapshots_for_report,
@@ -72,7 +75,6 @@ from app.services.report_transactions import (
     schedule_transaction_metric_snapshot_generation,
     schedule_transaction_snapshot_generation,
 )
-
 
 log = logging.getLogger(__name__)
 
@@ -469,8 +471,9 @@ async def download_artifact(db: AsyncSession, id: int, name: str) -> str:
 async def get_jmeter_result_by_report(db: AsyncSession, report_id: int) -> list:
     """读取指定报告 jmeter.log 的实时 summary 数据。（兼容旧接口）"""
 
-    from app.schemas.testcase import JMeterResultVO
     import re
+
+    from app.schemas.testcase import JMeterResultVO
 
     _RESULT_RE = re.compile(
         r"\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}),\d{3} INFO.*summary \+.* (\d+\.\d+)/s Avg: +(\d+)"

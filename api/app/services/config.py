@@ -7,6 +7,7 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import stamp_create, stamp_modify
+from app.core.codes import Codes
 from app.core.config_catalog import (
     CATEGORIES,
     DEFAULT_CONFIG_VALUES,
@@ -14,7 +15,6 @@ from app.core.config_catalog import (
     get_category_sort,
     get_config_meta,
 )
-from app.core.codes import Codes
 from app.core.context import UserContext
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
@@ -23,6 +23,9 @@ from app.models.config import Config
 from app.schemas.config import ConfigCategoryVO, ConfigParam, ConfigQuery, ConfigVO
 
 log = logging.getLogger(__name__)
+_LEGACY_DEFAULT_VALUE_MIGRATIONS = {
+    "REPORT_RUNNING_METRIC_REFRESH_SECONDS": {"30": "5"},
+}
 
 
 def _check_param(param: ConfigParam) -> None:
@@ -119,9 +122,15 @@ async def get_categories() -> list[ConfigCategoryVO]:
 async def ensure_default_configs(db: AsyncSession) -> int:
     """补齐新增的内置配置项，不覆盖用户已有配置。"""
     created = 0
+    migrated = 0
     for key, default_value in DEFAULT_CONFIG_VALUES.items():
         existing = await crud.get_by_key(db, key)
         if existing is not None:
+            migration = _LEGACY_DEFAULT_VALUE_MIGRATIONS.get(key, {})
+            migrated_value = migration.get(existing.config_value)
+            if migrated_value is not None:
+                existing.config_value = migrated_value
+                migrated += 1
             continue
         meta = get_config_meta(key)
         db.add(
@@ -132,9 +141,9 @@ async def ensure_default_configs(db: AsyncSession) -> int:
             )
         )
         created += 1
-    if created:
+    if created or migrated:
         await db.commit()
-        log.info("补齐默认配置项 %d 个", created)
+        log.info("补齐默认配置项 %d 个，迁移旧默认值 %d 个", created, migrated)
     return created
 
 

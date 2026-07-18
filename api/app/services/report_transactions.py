@@ -8,7 +8,8 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete as sql_delete, select
+from sqlalchemy import delete as sql_delete
+from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +38,7 @@ from app.services.report_metrics import (
     _round2,
     _to_float,
     _to_int,
-    generate_metric_snapshots_for_report,
+    schedule_metric_snapshot_generation,
 )
 
 log = logging.getLogger(__name__)
@@ -330,8 +331,8 @@ async def get_transaction_stats(db: AsyncSession, report_id: int) -> list[Transa
     if snapshots:
         return snapshots
 
-    await generate_transaction_snapshots_for_report(db, report_id)
-    return await _list_transaction_snapshots(db, report_id)
+    schedule_transaction_snapshot_generation(report_id)
+    return []
 
 def _parse_jtl_transaction_metrics(
     jtl_path: str,
@@ -629,23 +630,23 @@ async def get_transaction_metrics(db: AsyncSession, report_id: int, window_sec: 
 
     snapshots = await _list_transaction_metric_snapshots(db, report_id, window_sec)
     if snapshots.transactions:
-        if not await _transaction_metric_snapshots_need_refresh(db, report_id, window_sec):
-            return snapshots
-        log.info("报告交易曲线快照版本过旧，重新解析 JTL 回填: report_id=%s window=%s", report_id, window_sec)
-        await generate_transaction_metric_snapshots_for_report(db, report_id, (window_sec,))
-        snapshots = await _list_transaction_metric_snapshots(db, report_id, window_sec)
+        if await _transaction_metric_snapshots_need_refresh(db, report_id, window_sec):
+            log.info("报告交易曲线快照版本过旧，后台解析 JTL 回填: report_id=%s window=%s", report_id, window_sec)
+            schedule_transaction_metric_snapshot_generation(report_id, (window_sec,))
         return snapshots
 
-    await generate_transaction_metric_snapshots_for_report(db, report_id, (window_sec,))
-    return await _list_transaction_metric_snapshots(db, report_id, window_sec)
+    schedule_transaction_metric_snapshot_generation(report_id, (window_sec,))
+    return snapshots
 
 async def get_transaction_trend(db: AsyncSession, report_id: int, window_sec: int = 60) -> TransactionTrendVO:
     transaction_metrics = await get_transaction_metrics(db, report_id, window_sec)
     metric_window = max(1, int(window_sec or 60))
-    overall_metrics = await _list_metric_snapshots(db, report_id, metric_window)
-    if not overall_metrics:
-        await generate_metric_snapshots_for_report(db, report_id, (metric_window,))
+    has_transaction_points = any(transaction_metrics.series.values())
+    overall_metrics: list[dict] = []
+    if not has_transaction_points:
         overall_metrics = await _list_metric_snapshots(db, report_id, metric_window)
+        if not overall_metrics:
+            schedule_metric_snapshot_generation(report_id, (metric_window,))
 
     timestamps = sorted({
         point.timestamp

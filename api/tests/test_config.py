@@ -166,7 +166,7 @@ async def test_ensure_default_configs_adds_prometheus_step_to_config_list(
         config for config in page["list"] if config["configKey"] == "REPORT_RUNNING_METRIC_REFRESH_SECONDS"
     )
 
-    assert item["configValue"] == "30"
+    assert item["configValue"] == "5"
     assert item["description"] == "运行中报告指标刷新间隔秒"
     assert item["category"] == "report"
     assert item["displayName"] == "运行中报告指标刷新间隔秒"
@@ -209,6 +209,29 @@ async def test_ensure_default_configs_does_not_overwrite_existing_value(
     assert len(rows) == 1
     assert rows[0].config_value == "45"
     assert rows[0].description == "自定义步长"
+
+
+@pytest.mark.asyncio
+async def test_ensure_default_configs_migrates_legacy_running_metric_interval(
+    db: AsyncSession,
+) -> None:
+    db.add(
+        Config(
+            config_key="REPORT_RUNNING_METRIC_REFRESH_SECONDS",
+            config_value="30",
+            description="运行中报告指标刷新间隔秒",
+        )
+    )
+    await db.commit()
+
+    await ensure_default_configs(db)
+
+    saved = (
+        await db.execute(
+            select(Config).where(Config.config_key == "REPORT_RUNNING_METRIC_REFRESH_SECONDS")
+        )
+    ).scalar_one()
+    assert saved.config_value == "5"
 
 
 @pytest.mark.asyncio
