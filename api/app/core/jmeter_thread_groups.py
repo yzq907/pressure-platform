@@ -62,20 +62,54 @@ def update_debug_thread(jmx_path: str) -> None:
     write_jmx(tree, jmx_path)
 
 
-def list_thread_groups(jmx_path: str) -> list[dict[str, str]]:
+def _thread_group_original_settings(el: Any, group_type: str) -> dict[str, Any]:
+    if group_type == "thread_group":
+        scheduler_raw = first_named_prop_text(el, "ThreadGroup.scheduler")
+        return {
+            "num_threads": first_named_prop_text(el, "ThreadGroup.num_threads") or "",
+            "ramp_time": first_named_prop_text(el, "ThreadGroup.ramp_time") or "",
+            "loops": first_named_prop_text(el, "LoopController.loops") or "",
+            "scheduler": (
+                str(scheduler_raw).strip().lower() in {"1", "true", "yes", "on"}
+                if scheduler_raw is not None
+                else None
+            ),
+            "duration": first_named_prop_text(el, "ThreadGroup.duration") or "",
+        }
+    if group_type == "stepping_thread_group":
+        return {
+            "num_threads": first_named_prop_text(el, "ThreadGroup.num_threads") or "",
+            "ramp_time": first_named_prop_text(el, "Start users period") or "",
+            "loops": first_named_prop_text(el, "LoopController.loops") or "",
+            "scheduler": None,
+            "duration": first_named_prop_text(el, "flighttime") or "",
+        }
+    return {
+        "num_threads": first_named_prop_text(el, "TargetLevel") or "",
+        "ramp_time": first_named_prop_text(el, "RampUp") or "",
+        "loops": first_named_prop_text(el, "Iterations") or "",
+        "scheduler": None,
+        "duration": first_named_prop_text(el, "Hold") or "",
+    }
+
+
+def list_thread_groups(jmx_path: str) -> list[dict[str, Any]]:
     """List all supported thread groups for run-time overrides."""
     tree = parse_jmx(jmx_path)
-    groups: list[dict[str, str]] = []
+    groups: list[dict[str, Any]] = []
     for el in tree.iter():
         indexed = thread_group_key(el, len(groups))
         if indexed:
             key, group_type = indexed
-            groups.append({
-                "key": key,
-                "name": el.get("testname") or "",
-                "type": group_type,
-                "enabled": is_enabled(el),
-            })
+            groups.append(
+                {
+                    "key": key,
+                    "name": el.get("testname") or "",
+                    "type": group_type,
+                    "enabled": is_enabled(el),
+                    **_thread_group_original_settings(el, group_type),
+                }
+            )
     return groups
 
 
@@ -249,21 +283,15 @@ def update_run_thread(
         else:
             key = ""
         override = overrides.get(key) or overrides.get(el.get("testname") or "")
+        fixed_mode = bool(override and override.get("mode") == "fixed")
         if override and override.get("enabled") is not None:
             el.set("enabled", "true" if as_bool(override.get("enabled")) else "false")
         if not is_enabled(el):
             continue
-        fixed_mode = bool(override and override.get("mode") == "fixed")
+        if fixed_mode:
+            continue
 
         if el.tag == "ThreadGroup" and el.get("testclass") == "ThreadGroup":
-            if fixed_mode:
-                set_named_props(el, {
-                    "LoopController.continue_forever": "true",
-                    "LoopController.loops": "-1",
-                    "ThreadGroup.duration": duration,
-                    "ThreadGroup.scheduler": "true",
-                })
-                continue
             values = _resolve_thread_values(el, key, overrides, num_threads, ramp_time, duration)
             if values is None:
                 continue
@@ -277,9 +305,6 @@ def update_run_thread(
                 "ThreadGroup.scheduler": "true",
             })
         elif el.tag == STEPPING_TG:
-            if fixed_mode:
-                set_named_props(el, {"flighttime": duration})
-                continue
             values = _resolve_thread_values(el, key, overrides, num_threads, ramp_time, duration)
             if values is None:
                 continue
@@ -294,9 +319,6 @@ def update_run_thread(
                 "rampUp": "1",
             })
         elif el.tag == CONCURRENCY_TG:
-            if fixed_mode:
-                set_named_props(el, {"Hold": duration})
-                continue
             values = _resolve_thread_values(el, key, overrides, num_threads, ramp_time, duration)
             if values is None:
                 continue

@@ -633,9 +633,39 @@ async def test_run_applies_thread_group_overrides(
     case_id = await _create_case_with_jmx(auth_client, "r_tg_override", sample_jmx_bytes)
     groups = await auth_client.get(f"/testcase/runThreadGroups/{case_id}")
     assert groups.json()["data"] == [
-        {"key": "thread_group:0", "name": "Default ThreadGroup", "type": "thread_group", "enabled": True},
-        {"key": "stepping_thread_group:1", "name": "Disabled Stepping", "type": "stepping_thread_group", "enabled": False},
-        {"key": "concurrency_thread_group:2", "name": "Concurrency Group", "type": "concurrency_thread_group", "enabled": True},
+        {
+            "key": "thread_group:0",
+            "name": "Default ThreadGroup",
+            "type": "thread_group",
+            "enabled": True,
+            "numThreads": "50",
+            "rampTime": "10",
+            "loops": "100",
+            "scheduler": False,
+            "duration": "",
+        },
+        {
+            "key": "stepping_thread_group:1",
+            "name": "Disabled Stepping",
+            "type": "stepping_thread_group",
+            "enabled": False,
+            "numThreads": "200",
+            "rampTime": "30",
+            "loops": "5",
+            "scheduler": None,
+            "duration": "60",
+        },
+        {
+            "key": "concurrency_thread_group:2",
+            "name": "Concurrency Group",
+            "type": "concurrency_thread_group",
+            "enabled": True,
+            "numThreads": "100",
+            "rampTime": "60",
+            "loops": "",
+            "scheduler": None,
+            "duration": "300",
+        },
     ]
 
     resp = await auth_client.post(
@@ -675,7 +705,7 @@ async def test_run_applies_thread_group_overrides(
     assert values[("Default ThreadGroup", "ThreadGroup.ramp_time")] == "1"
     assert values[("Default ThreadGroup", "ThreadGroup.duration")] == "600"
     assert values[("Concurrency Group", "TargetLevel")] == "100"
-    assert values[("Concurrency Group", "Hold")] == "600"
+    assert values[("Concurrency Group", "Hold")] == "300"
 
 
 @pytest.mark.asyncio

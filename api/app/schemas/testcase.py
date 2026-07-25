@@ -94,7 +94,7 @@ class RunParam(CamelModel):
 
 
 class ThreadGroupRunOverride(CamelModel):
-    """单次执行的线程组参数覆盖。mode=global 跟随全局，custom 自定义，fixed 保留 JMX 原值。"""
+    """单次执行的线程组参数覆盖。fixed 使用原始 JMX 线程组参数。"""
 
     key: str | None = None
     name: str
@@ -106,12 +106,17 @@ class ThreadGroupRunOverride(CamelModel):
 
 
 class ThreadGroupRunVO(CamelModel):
-    """JMX 中可配置的启用线程组。"""
+    """JMX 中可配置的线程组及其原始运行参数。"""
 
     key: str = ""
     name: str = ""
     type: str = ""
     enabled: bool = True
+    num_threads: str = ""
+    ramp_time: str = ""
+    loops: str = ""
+    scheduler: bool | None = None
+    duration: str = ""
 
 
 class TransactionRunVO(CamelModel):

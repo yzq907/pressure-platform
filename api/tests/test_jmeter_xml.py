@@ -229,10 +229,10 @@ def test_update_run_thread_applies_named_thread_group_overrides(tmp_path: Path) 
     assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.duration") == ["600"]
     assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "TargetLevel") == ["100"]
     assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "RampUp") == ["60"]
-    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "Hold") == ["600"]
+    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "Hold") == ["300"]
 
 
-def test_update_run_thread_fixed_mode_keeps_pressure_but_uses_global_duration(tmp_path: Path) -> None:
+def test_update_run_thread_fixed_mode_uses_original_script_settings(tmp_path: Path) -> None:
     jmx = _copy_sample(tmp_path)
     dest = tmp_path / "run.jmx"
 
@@ -252,20 +252,48 @@ def test_update_run_thread_fixed_mode_keeps_pressure_but_uses_global_duration(tm
     tree = etree.parse(str(dest))
     assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.num_threads") == ["50"]
     assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.ramp_time") == ["10"]
-    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.scheduler") == ["true"]
-    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.duration") == ["600"]
-    assert _find_named_text(tree, "ThreadGroup", "LoopController.continue_forever") == ["true"]
-    assert _find_named_text(tree, "ThreadGroup", "LoopController.loops") == ["-1"]
+    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.scheduler") == ["false"]
+    assert _find_named_text(tree, "ThreadGroup", "ThreadGroup.duration") == [None]
+    assert _find_named_text(tree, "ThreadGroup", "LoopController.continue_forever") == ["false"]
+    assert _find_named_text(tree, "ThreadGroup", "LoopController.loops") == ["100"]
 
     stepping = next(tree.iter("kg.apc.jmeter.threads.SteppingThreadGroup"))
     assert stepping.get("enabled") == "true"
     assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "ThreadGroup.num_threads") == ["200"]
     assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "Start users period") == ["30"]
-    assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "flighttime") == ["600"]
+    assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "flighttime") == ["60"]
+    assert _find_named_text(tree, "kg.apc.jmeter.threads.SteppingThreadGroup", "LoopController.loops") == ["5"]
 
     assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "TargetLevel") == ["100"]
     assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "RampUp") == ["60"]
-    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "Hold") == ["600"]
+    assert _find_named_text(tree, "com.blazemeter.jmeter.threads.concurrency.ConcurrencyThreadGroup", "Hold") == ["300"]
+
+
+def test_update_run_thread_fixed_mode_preserves_ten_loop_baseline(tmp_path: Path) -> None:
+    jmx = _copy_sample(tmp_path)
+    tree = etree.parse(str(jmx))
+    loop_prop = next(
+        prop
+        for prop in next(tree.iter("ThreadGroup")).iter()
+        if prop.get("name") == "LoopController.loops"
+    )
+    loop_prop.text = "10"
+    tree.write(str(jmx), xml_declaration=True, encoding="UTF-8", standalone=False)
+    dest = tmp_path / "run.jmx"
+
+    jmeter_xml.update_run_thread(
+        str(jmx),
+        str(dest),
+        "50",
+        "30",
+        "600",
+        [{"key": "thread_group:0", "name": "Default ThreadGroup", "mode": "fixed"}],
+    )
+
+    run_tree = etree.parse(str(dest))
+    assert _find_named_text(run_tree, "ThreadGroup", "ThreadGroup.num_threads") == ["50"]
+    assert _find_named_text(run_tree, "ThreadGroup", "LoopController.loops") == ["10"]
+    assert _find_named_text(run_tree, "ThreadGroup", "ThreadGroup.scheduler") == ["false"]
 
 
 def test_list_thread_groups_returns_all_groups_with_key_and_enabled(tmp_path: Path) -> None:
@@ -274,9 +302,39 @@ def test_list_thread_groups_returns_all_groups_with_key_and_enabled(tmp_path: Pa
     groups = jmeter_xml.list_thread_groups(str(jmx))
 
     assert groups == [
-        {"key": "thread_group:0", "name": "Default ThreadGroup", "type": "thread_group", "enabled": True},
-        {"key": "stepping_thread_group:1", "name": "Disabled Stepping", "type": "stepping_thread_group", "enabled": False},
-        {"key": "concurrency_thread_group:2", "name": "Concurrency Group", "type": "concurrency_thread_group", "enabled": True},
+        {
+            "key": "thread_group:0",
+            "name": "Default ThreadGroup",
+            "type": "thread_group",
+            "enabled": True,
+            "num_threads": "50",
+            "ramp_time": "10",
+            "loops": "100",
+            "scheduler": False,
+            "duration": "",
+        },
+        {
+            "key": "stepping_thread_group:1",
+            "name": "Disabled Stepping",
+            "type": "stepping_thread_group",
+            "enabled": False,
+            "num_threads": "200",
+            "ramp_time": "30",
+            "loops": "5",
+            "scheduler": None,
+            "duration": "60",
+        },
+        {
+            "key": "concurrency_thread_group:2",
+            "name": "Concurrency Group",
+            "type": "concurrency_thread_group",
+            "enabled": True,
+            "num_threads": "100",
+            "ramp_time": "60",
+            "loops": "",
+            "scheduler": None,
+            "duration": "300",
+        },
     ]
 
 
@@ -405,6 +463,28 @@ def test_apply_thread_group_pacing_skips_when_pacing_zero(tmp_path: Path) -> Non
         str(src),
         str(dest),
         [{"key": "thread_group:0", "name": "2_策略获取", "enabled": True, "pacing_ms": 0}],
+    )
+
+    tree = etree.parse(str(dest))
+    assert list(tree.iter("JSR223Timer")) == []
+
+
+def test_apply_thread_group_pacing_skips_fixed_original_script_mode(tmp_path: Path) -> None:
+    jmx = _copy_sample(tmp_path)
+    dest = tmp_path / "run.jmx"
+
+    jmeter_xml.apply_thread_group_pacing(
+        str(jmx),
+        str(dest),
+        [
+            {
+                "key": "thread_group:0",
+                "name": "Default ThreadGroup",
+                "enabled": True,
+                "mode": "fixed",
+                "pacing_ms": 1000,
+            }
+        ],
     )
 
     tree = etree.parse(str(dest))

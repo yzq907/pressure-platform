@@ -18,7 +18,11 @@ def _transaction_config_by_key(items: list[dict] | None) -> dict[str, dict]:
     configs: dict[str, dict] = {}
     for item in items or []:
         key = _transaction_config_key(item)
-        if key and as_bool(item.get("enabled", True)):
+        if (
+            key
+            and as_bool(item.get("enabled", True))
+            and str(item.get("mode") or "global") != "fixed"
+        ):
             configs[key] = item
     return configs
 
