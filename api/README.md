@@ -1,6 +1,6 @@
 # Mysterious API (Python 重构版)
 
-基于 FastAPI + SQLAlchemy 2.0 的分布式压测平台后端，对应原 Java SpringBoot 项目的功能重构。
+基于 FastAPI + SQLAlchemy 2.0 的分布式压测平台后端。
 
 ## 环境要求
 
@@ -52,10 +52,3 @@ app/
 ├── crud/              # 数据访问（Phase 1+）
 └── services/          # 业务服务（Phase 1+）
 ```
-
-## 与 Java 后端的关系
-
-- 数据库表结构完全沿用 `docker/init.sql`，不重新建表
-- 服务端口 4321，与 Java 端一致；切换时需先停 Java 服务
-- 统一返回格式 `{code, message, success, currentTime, data}` 与 Java 端 1:1 兼容，前端无需改动
-- 鉴权 token 与 Java 同库共用（DB 里的 `mysterious_user.token`）
