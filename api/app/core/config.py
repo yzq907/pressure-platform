@@ -3,8 +3,22 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
+import sys
+from pathlib import Path
+
+from pydantic import Field
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def default_log_dir() -> str:
+    program_dir = (
+        Path(sys.executable).resolve().parent
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parents[2]
+    )
+    return str(program_dir / "logs")
 
 
 class Settings(BaseSettings):
@@ -16,6 +30,9 @@ class Settings(BaseSettings):
     )
 
     server_port: int = 4321
+    server_host: str = "0.0.0.0"
+    frontend_dist: str = ""
+    data_dir: str = ""
     mysql_url: str = (
         "mysql+asyncmy://root:Test%40123456@localhost:3306/mysterious?charset=utf8mb4"
     )
@@ -24,7 +41,9 @@ class Settings(BaseSettings):
     bcrypt_rounds: int = 12
     cors_origins: str = "*"
     upload_max_size_mb: int = 100
-    log_dir: str = "./logs"
+    log_dir: str = Field(default_factory=default_log_dir)
+    log_max_bytes: int = 50 * 1024 * 1024
+    log_backup_days: int = 7
 
     @property
     def cors_origins_list(self) -> list[str]:
@@ -33,4 +52,4 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()
+    return Settings(_env_file=os.environ.get("MYSTERIOUS_CONFIG_FILE", ".env"))

@@ -49,3 +49,6 @@ LOG_HOME_IS_UNDEFINED
 # Claude Code 个人设置（包含 bypassPermissions 等敏感配置）
 .claude/settings.local.json
 .claude/
+/api/build/
+/api/dist/
+/api/dist-onefile/

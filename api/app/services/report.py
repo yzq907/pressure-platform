@@ -320,7 +320,17 @@ async def view_report(db: AsyncSession, id: int) -> str:
     if not os.listdir(report_dir):
         raise MysteriousException(Codes.REPORT_DIR_IS_EMPTY)
 
-    # 构造相对路径：去掉 mysterious-data 前缀或 /data 前缀
+    from app.core.config import get_settings
+    from pathlib import Path
+    from urllib.parse import quote
+    if get_settings().data_dir:
+        try:
+            relative_path = Path(report_dir).resolve().relative_to(Path(get_settings().data_dir).resolve())
+        except ValueError:
+            raise MysteriousException(Codes.REPORT_DIR_NOT_EXIST, message="报告目录不在配置的数据目录中")
+        return "/reports/" + quote((relative_path / "index.html").as_posix(), safe="/")
+
+    # 兼容旧部署的数据库配置
     if "mysterious-data" in report_dir:
         relative = report_dir.split("mysterious-data")[1]
     else:

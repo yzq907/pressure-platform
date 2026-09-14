@@ -27,6 +27,7 @@ from app.api.v1.testcase import router as testcase_router
 from app.api.v1.upload_file import router as upload_file_router
 from app.api.v1.user import router as user_router
 from app.core.config import get_settings
+from app.core.web import ApiPrefixMiddleware, FrontendFiles
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
 from app.db.redis import dispose_redis
@@ -188,6 +189,13 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    if not settings.data_dir.strip():
+        raise RuntimeError("必须配置数据目录 MYSTERIOUS_DATA_DIR，不能为空")
+    reports_dir = Path(settings.data_dir)
+    try:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"无法创建或访问数据目录 MYSTERIOUS_DATA_DIR={reports_dir}: {exc}") from exc
     app = FastAPI(
         title="Mysterious 压测平台后端 (Python)",
         description="基于 FastAPI + SQLAlchemy 2.0 的分布式压测平台后端 API",
@@ -210,6 +218,7 @@ def create_app() -> FastAPI:
     )
 
     register_exception_handlers(app)
+    app.add_middleware(ApiPrefixMiddleware)
 
     app.include_router(health_router)
     app.include_router(user_router)
@@ -227,9 +236,12 @@ def create_app() -> FastAPI:
     app.include_router(audit_log_router)
 
     # 报告预览静态文件服务
-    reports_dir = "/root/PyProject/mysterious-data"
-    if Path(reports_dir).is_dir():
-        app.mount("/reports", StaticFiles(directory=reports_dir), name="reports")
+    app.mount("/reports", StaticFiles(directory=reports_dir), name="reports")
+
+    if settings.frontend_dist:
+        if not (Path(settings.frontend_dist) / "index.html").is_file():
+            raise RuntimeError(f"前端构建文件不存在: {settings.frontend_dist}/index.html")
+        app.mount("/", FrontendFiles(directory=settings.frontend_dist, html=True), name="frontend")
 
     return app
 

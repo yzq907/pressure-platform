@@ -149,6 +149,9 @@ async def ensure_default_configs(db: AsyncSession) -> int:
 
 async def get_value(db: AsyncSession, key: str) -> str:
     """对齐 Java IConfigService.getValue：找不到抛 CONFIG_NOT_EXIST + key"""
+    from app.core.config import get_settings
+    if key == "MASTER_DATA_HOME" and get_settings().data_dir:
+        return get_settings().data_dir
     value = await crud.get_value(db, key)
     if value is None or value == "":
         raise MysteriousException(Codes.CONFIG_NOT_EXIST, message=f"配置不存在: {key}")
@@ -156,6 +159,9 @@ async def get_value(db: AsyncSession, key: str) -> str:
 
 
 async def get_value_or_default(db: AsyncSession, key: str, default: str = "") -> str:
+    from app.core.config import get_settings
+    if key == "MASTER_DATA_HOME" and get_settings().data_dir:
+        return get_settings().data_dir
     value = await crud.get_value(db, key)
     return value if value not in (None, "") else default
 
