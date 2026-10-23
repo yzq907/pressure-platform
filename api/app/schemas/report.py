@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List
+from typing import Annotated, List
 
-from pydantic import field_serializer
+from pydantic import Field, field_serializer
 
-from app.schemas.base import _fmt_dt
-from app.schemas.base import BaseQuery, BaseVO, CamelModel
+from app.schemas.base import BaseQuery, BaseVO, CamelModel, _fmt_dt
 
 
 class ReportParam(CamelModel):
@@ -57,6 +56,22 @@ class ReportStatsVO(CamelModel):
     failed: int = 0
     idle: int = 0
     success_rate: float = 100.0
+
+
+class ReportBatchCleanParam(CamelModel):
+    ids: list[Annotated[int, Field(strict=True, gt=0)]] = Field(min_length=1, max_length=100)
+
+
+class ReportCleanFailureVO(CamelModel):
+    id: int
+    message: str
+
+
+class ReportBatchCleanVO(CamelModel):
+    deleted_ids: list[int] = Field(default_factory=list)
+    failures: list[ReportCleanFailureVO] = Field(default_factory=list)
+    success_count: int = 0
+    failed_count: int = 0
 
 
 class ReportQuery(BaseQuery):

@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.enums import NodeStatus, NodeType
+from app.core.ssh_credentials import decrypt_password
 from app.models.execution_node import ExecutionNode
 from app.models.node import Node
 
@@ -59,7 +60,7 @@ async def test_node_heartbeat_restarts_missing_jmeter_server_for_enabled_slave(
     await db.commit()
     await db.refresh(node)
 
-    await node_heartbeat._heartbeat_round(db)
+    await node_heartbeat._heartbeat_round()
 
     await db.refresh(node)
     assert node.status == NodeStatus.ENABLE.value
@@ -110,7 +111,7 @@ async def test_node_heartbeat_keeps_enabled_slave_unhealthy_when_jmeter_restart_
     await db.commit()
     await db.refresh(node)
 
-    await node_heartbeat._heartbeat_round(db)
+    await node_heartbeat._heartbeat_round()
 
     await db.refresh(node)
     assert node.status == NodeStatus.ENABLE.value
@@ -203,22 +204,25 @@ async def test_update_node_password_only_when_explicit_new_value(
     resp = await auth_client.post(f"/node/update/{node_id}", json={"description": "no password"})
     assert resp.json()["data"] is True
     obj = (await db.execute(select(Node).where(Node.id == node_id))).scalar_one()
-    assert obj.password == "old-secret"
+    original_envelope = obj.password
+    assert decrypt_password(obj.password) == "old-secret"
+    assert obj.password != "old-secret"
 
     resp = await auth_client.post(f"/node/update/{node_id}", json={"password": ""})
     assert resp.json()["data"] is True
     await db.refresh(obj)
-    assert obj.password == "old-secret"
+    assert obj.password == original_envelope
 
     resp = await auth_client.post(f"/node/update/{node_id}", json={"password": "******"})
     assert resp.json()["data"] is True
     await db.refresh(obj)
-    assert obj.password == "old-secret"
+    assert obj.password == original_envelope
 
     resp = await auth_client.post(f"/node/update/{node_id}", json={"password": "new-secret"})
     assert resp.json()["data"] is True
     await db.refresh(obj)
-    assert obj.password == "new-secret"
+    assert obj.password != original_envelope
+    assert decrypt_password(obj.password) == "new-secret"
 
 
 @pytest.mark.asyncio

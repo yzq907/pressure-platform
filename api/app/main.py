@@ -10,7 +10,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.audit_log import router as audit_log_router
 from app.api.v1.ai_generation import router as ai_generation_router
@@ -27,12 +26,14 @@ from app.api.v1.testcase import router as testcase_router
 from app.api.v1.upload_file import router as upload_file_router
 from app.api.v1.user import router as user_router
 from app.core.config import get_settings
+from app.core.report_preview import ReportPreviewFiles
 from app.core.web import ApiPrefixMiddleware, FrontendFiles
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import setup_logging
 from app.db.redis import dispose_redis
 from app.db import session as session_module
 from app.db.session import dispose_engine
+
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -121,6 +122,11 @@ async def _recover_stuck_tasks() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.core.ssh_credentials import load_master_key
+    from app.services.node_credentials import migrate_node_passwords
+
+    # Fail before any database mutation, task recovery or scheduler activity.
+    load_master_key()
     app.state.start_time = time.monotonic()
     log.info("Mysterious API starting on port %s", get_settings().server_port)
 
@@ -138,7 +144,12 @@ async def lifespan(app: FastAPI):
         ensure_report_snapshot_columns,
         ensure_scheduled_task_log_table,
         ensure_user_session_table,
+        ensure_node_password_text_column,
     )
+    await ensure_node_password_text_column()
+    async with session_module.AsyncSessionLocal() as db:
+        migrated = await migrate_node_passwords(db)
+    log.info("SSH 密码迁移检查完成，本次加密 %d 个节点", migrated)
     await ensure_config_value_text_column()
     await ensure_ai_generation_tables()
     await ensure_report_snapshot_columns()
@@ -153,7 +164,7 @@ async def lifespan(app: FastAPI):
     await ensure_report_transaction_metric_snapshot_table()
     await ensure_user_session_table()
 
-    # 初始化：创建 admin 用户（如不存在）
+    # 初始化内置角色和权限；admin 账号由数据库初始化 SQL 创建。
     async with session_module.AsyncSessionLocal() as db:
         from app.services.config import ensure_default_configs
         from app.services.user import ensure_admin_user
@@ -235,8 +246,8 @@ def create_app() -> FastAPI:
     app.include_router(scheduled_task_router)
     app.include_router(audit_log_router)
 
-    # 报告预览静态文件服务
-    app.mount("/reports", StaticFiles(directory=reports_dir), name="reports")
+    # Only signed, short-lived links can access one report's HTML assets.
+    app.mount("/reports", ReportPreviewFiles(directory=reports_dir), name="reports")
 
     if settings.frontend_dist:
         if not (Path(settings.frontend_dist) / "index.html").is_file():

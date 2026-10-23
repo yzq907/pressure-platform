@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +14,14 @@ from app.core.context import UserContext
 from app.core.enums import NodeStatus, NodeType
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
+from app.core.shell_safety import (
+    build_jmeter_server_start,
+    build_remote_file_remove,
+    jmeter_server_path,
+    validate_node_host,
+)
 from app.core.ssh import SSHClient
+from app.core.ssh_credentials import encrypt_password
 from app.crud import node as crud
 from app.models.node import Node
 from app.schemas.node import NodeParam, NodeQuery, NodeVO
@@ -34,6 +42,7 @@ def _check_param(param: NodeParam) -> None:
         raise MysteriousException(Codes.PARAMS_EMPTY)
     if not param.host or not param.username or param.port is None or param.type is None:
         raise MysteriousException(Codes.PARAM_MISSING)
+    validate_node_host(param.host)
 
 
 def _to_vo(obj: Node, mask_password: bool = False) -> NodeVO:
@@ -55,7 +64,7 @@ async def add_node(db: AsyncSession, param: NodeParam, user: UserContext) -> int
         type=param.type or 0,
         host=param.host or "",
         username=param.username or "",
-        password=param.password or "",
+        password=encrypt_password(param.password or ""),
         port=param.port or 0,
         status=NodeStatus.DISABLED.value,
         region=param.region or "",
@@ -73,13 +82,15 @@ async def update_node(
         return False
 
     sent = param.model_dump(exclude_unset=True, exclude_none=True, by_alias=False)
+    if "host" in sent:
+        validate_node_host(sent["host"])
     for field in ("name", "description", "type", "host", "username", "port", "region"):
         if field in sent:
             setattr(existing, field, sent[field])
     if "password" in sent:
         password = str(sent["password"] or "").strip()
         if password and password != "******":
-            existing.password = password
+            existing.password = encrypt_password(password)
     stamp_modify(existing, user)
     return await crud.update(db, existing)
 
@@ -168,7 +179,8 @@ async def enable_node(db: AsyncSession, id: int, user: UserContext) -> bool:
     try:
         slave_bin = await config_service.get_value(db, "SLAVE_JMETER_BIN_HOME")
         slave_log = await config_service.get_value(db, "SLAVE_JMETER_LOG_HOME")
-        jmeter_server = f"{slave_bin}/jmeter-server"
+        jmeter_server = jmeter_server_path(slave_bin)
+        start_cmd = build_jmeter_server_start(slave_bin, slave_log, obj.host)
 
         ssh = SSHClient(obj.host, obj.port, obj.username, obj.password)
 
@@ -181,7 +193,7 @@ async def enable_node(db: AsyncSession, id: int, user: UserContext) -> bool:
 
         # md5sum
         try:
-            md5 = await ssh.exec_command(f"md5sum {jmeter_server} | cut -d ' ' -f 1")
+            md5 = await ssh.exec_command(f"md5sum -- {shlex.quote(jmeter_server)} | cut -d ' ' -f 1")
         except MysteriousException as e:
             log.info("md5 命令异常 host=%s", obj.host)
             raise MysteriousException(Codes.SSH_AND_LOGIN_ERROR) from e
@@ -195,10 +207,6 @@ async def enable_node(db: AsyncSession, id: int, user: UserContext) -> bool:
             raise MysteriousException(Codes.JMETER_SERVER_IS_ENABLE)
 
         # 启动
-        start_cmd = (
-            f"mkdir -p {slave_log} && cd {slave_log} && nohup {jmeter_server} "
-            f"-Djava.rmi.server.hostname={obj.host} > jmeter-server.log 2>&1 & echo $!"
-        )
         result = await ssh.exec_command(start_cmd)
         log.info("启动命令行输出 host=%s: %s", obj.host, result)
         if result == "null":
@@ -264,10 +272,11 @@ async def scp_to_enabled_slaves(
 
 
 async def rm_on_enabled_slaves(db: AsyncSession, remote_path: str) -> None:
-    """对每个 enabled slave 执行 rm -rf"""
+    """在每个 enabled slave 上删除一个文件，不执行递归删除。"""
+    command = build_remote_file_remove(remote_path)
     for node in await crud.list_enable_slaves(db):
         try:
             ssh = SSHClient(node.host, node.port, node.username, node.password)
-            await ssh.exec_command(f"rm -rf {remote_path}")
+            await ssh.exec_command(command)
         except Exception:  # noqa: BLE001
-            log.warning("rm -rf 在 slave %s 失败", node.host, exc_info=True)
+            log.warning("删除文件在 slave %s 失败", node.host, exc_info=True)

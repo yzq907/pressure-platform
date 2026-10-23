@@ -11,6 +11,22 @@ from app.db.session import async_engine
 log = logging.getLogger(__name__)
 
 
+async def ensure_node_password_text_column() -> None:
+    """AES-GCM envelopes do not fit the legacy VARCHAR(128) column."""
+    async with async_engine.begin() as conn:
+        if conn.dialect.name != "mysql":
+            return
+        columns = await conn.run_sync(
+            lambda sync_conn: {col["name"]: col for col in inspect(sync_conn).get_columns("mysterious_node")}
+        )
+        column = columns.get("password")
+        if column is None:
+            raise RuntimeError("缺少 mysterious_node.password，请先初始化数据库")
+        if "text" not in str(column["type"]).lower():
+            await conn.execute(text("ALTER TABLE mysterious_node MODIFY COLUMN password TEXT NOT NULL COMMENT 'SSH登录密码密文'"))
+            log.info("已升级 mysterious_node.password 为 TEXT")
+
+
 async def ensure_config_value_text_column() -> None:
     """Allow JSON-style configuration values longer than 255 chars."""
     async with async_engine.begin() as conn:

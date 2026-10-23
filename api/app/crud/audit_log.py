@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_log import AuditLog
@@ -62,3 +60,16 @@ async def count(
         stmt = stmt.where(AuditLog.resource_id == resource_id)
     result = await db.execute(stmt)
     return result.scalar_one() or 0
+
+
+async def lock_existing_ids(db: AsyncSession, ids: list[int]) -> list[int]:
+    """在事务中锁定并返回仍存在的日志 ID。"""
+    result = await db.execute(
+        select(AuditLog.id).where(AuditLog.id.in_(ids)).with_for_update()
+    )
+    return list(result.scalars().all())
+
+
+async def delete_ids(db: AsyncSession, ids: list[int]) -> None:
+    if ids:
+        await db.execute(delete(AuditLog).where(AuditLog.id.in_(ids)))

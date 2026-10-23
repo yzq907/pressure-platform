@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 import os
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +36,7 @@ class Settings(BaseSettings):
         "mysql+asyncmy://root:Test%40123456@localhost:3306/mysterious?charset=utf8mb4"
     )
     redis_url: str = "redis://localhost:6379/0"
+    ssh_password_key_file: str = ""
     token_expire_hours: int = 12
     bcrypt_rounds: int = 12
     cors_origins: str = "*"

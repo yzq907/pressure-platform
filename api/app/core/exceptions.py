@@ -50,8 +50,10 @@ async def mysterious_exception_handler(request: Request, exc: Exception) -> JSON
 
 async def validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
-    log.warning("Validation error at %s: %s", request.url.path, exc.errors())
-    return _to_json(fail_with_message(Codes.PARAM_WRONG.code, f"参数不正确: {exc.errors()}"))
+    # Preserve field/type diagnostics, not raw inputs (which may contain credentials).
+    errors = [{key: error[key] for key in ("type", "loc", "msg") if key in error} for error in exc.errors()]
+    log.warning("Validation error at %s: %s", request.url.path, errors)
+    return _to_json(fail_with_message(Codes.PARAM_WRONG.code, f"参数不正确: {errors}"))
 
 
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:

@@ -59,6 +59,23 @@ _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 _ACTIVE_RUN_STATUSES = ("preparing", "running", "stopping")
 
 
+def jmeter_subprocess_env() -> dict[str, str]:
+    """Return a safe environment for JMeter after JDK package upgrades.
+
+    JMeter gives JAVA_HOME/JRE_HOME priority over PATH.  A long-running
+    platform process can retain a Java home which was removed by an RPM
+    upgrade, so do not forward a configured home unless its java binary
+    still exists.
+    """
+    env = os.environ.copy()
+    for key in ("JAVA_HOME", "JRE_HOME"):
+        java_home = env.get(key)
+        if java_home and not os.path.isfile(os.path.join(java_home, "bin", "java")):
+            log.warning("忽略失效的 %s=%s，JMeter 将从 PATH 自动发现 Java", key, java_home)
+            env.pop(key, None)
+    return env
+
+
 def _now() -> datetime:
     return datetime.now()
 
@@ -579,6 +596,7 @@ async def _run_and_callback(
             stdout=PIPE,
             stderr=PIPE,
             start_new_session=True,
+            env=jmeter_subprocess_env(),
         )
         _running_processes[report_id] = proc
         await _mark_execution_run_running(report_id, proc)

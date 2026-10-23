@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import base64
+import os
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
@@ -34,6 +36,17 @@ from app.models.role import Role, RolePermission
 from app.models.user import User
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ssh_key(tmp_path: Path, monkeypatch) -> None:
+    """Never use the deployed master key when exercising credential writes."""
+    from app.core.config import get_settings
+
+    path = tmp_path / "test-ssh-password.key"
+    path.write_bytes(base64.b64encode(os.urandom(32)) + b"\n")
+    path.chmod(0o600)
+    monkeypatch.setattr(get_settings(), "ssh_password_key_file", str(path))
 
 
 # StaticPool + check_same_thread=False 是 SQLite 内存库共享连接的标准做法

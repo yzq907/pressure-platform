@@ -33,6 +33,7 @@ hs_err_pid*
 target/
 */logs/*
 logs/*
+*/docs/*
 */.settings/*
 .jde_tree_state
 .#webclasspath
@@ -52,3 +53,6 @@ LOG_HOME_IS_UNDEFINED
 /api/build/
 /api/dist/
 /api/dist-onefile/
+# External SSH credential master keys must never enter source control or releases.
+ssh-password.key
+*.ssh-password.key

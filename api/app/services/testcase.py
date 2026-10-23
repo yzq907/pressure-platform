@@ -29,6 +29,7 @@ from app.core.context import UserContext
 from app.core.enums import ExecType, NodeStatus, TestCaseStatus
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
+from app.core.shell_safety import build_jmeter_server_start
 from app.core.ssh import SSHClient
 from app.core.jmeter_error_samples import (
     DEFAULT_ERROR_SAMPLE_PER_CODE_LIMIT,
@@ -1403,9 +1404,9 @@ async def _stop_remote_engines(db: AsyncSession, report: ReportModel) -> str:
 
 
 async def _stop_remote_engine(node, slave_bin: str, slave_log: str) -> bool:
+    start_cmd = build_jmeter_server_start(slave_bin, slave_log, node.host)
     ssh = SSHClient(node.host, node.port, node.username, node.password)
     slave_bin = slave_bin.rstrip("/")
-    slave_log = slave_log.rstrip("/")
     shutdown_cmd = shlex.quote(f"{slave_bin}/shutdown.sh")
     await ssh.exec_command(shutdown_cmd)
     if _REMOTE_STOP_WAIT_SECONDS > 0:
@@ -1414,12 +1415,6 @@ async def _stop_remote_engine(node, slave_bin: str, slave_log: str) -> bool:
     ps_after_shutdown = await ssh.exec_command(_JMETER_SERVER_PS_CMD)
     server_still_running = _remote_jmeter_server_running(ps_after_shutdown)
 
-    start_cmd = (
-        f"mkdir -p {shlex.quote(slave_log)} && cd {shlex.quote(slave_log)} && "
-        f"nohup {shlex.quote(f'{slave_bin}/jmeter-server')} "
-        f"-Djava.rmi.server.hostname={shlex.quote(node.host)} "
-        f"> jmeter-server.log 2>&1 & echo $!"
-    )
     last_start_output = ""
     last_ps_output = ""
     for attempt in range(1, _REMOTE_RESTART_ATTEMPTS + 1):

@@ -147,7 +147,7 @@ async def test_delete_normal_jar_rm_on_slaves(
     rm_calls: list[str] = []
 
     async def tracking_exec(self, command: str) -> str:
-        if "rm -rf" in command:
+        if command.startswith("rm -f -- "):
             rm_calls.append(command)
         return "null" if "ps aux" in command else ""
 

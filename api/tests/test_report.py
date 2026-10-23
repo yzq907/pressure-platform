@@ -1881,7 +1881,10 @@ async def test_view_debug_report_blocked(auth_client: AsyncClient, db: AsyncSess
 
 
 @pytest.mark.asyncio
-async def test_view_report_success(auth_client: AsyncClient, db: AsyncSession, tmp_path) -> None:
+async def test_view_report_success(auth_client: AsyncClient, db: AsyncSession, tmp_path, monkeypatch) -> None:
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "data_dir", str(tmp_path))
     report_dir = str(tmp_path / "2026-05-13-12:00:00" / "data")
     os.makedirs(report_dir, exist_ok=True)
     (tmp_path / "2026-05-13-12:00:00" / "data" / "index.html").write_text("report")
@@ -1894,6 +1897,8 @@ async def test_view_report_success(auth_client: AsyncClient, db: AsyncSession, t
     resp = await auth_client.get(f"/report/view/{rid}")
     assert resp.json()["code"] == 0
     assert resp.json()["data"].endswith("/index.html")
+    assert resp.json()["data"].startswith("/reports/")
+    assert "/2026-05-13-12:00:00/" not in resp.json()["data"]
 
 
 @pytest.mark.asyncio

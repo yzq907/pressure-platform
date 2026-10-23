@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -13,7 +12,13 @@ from app.core.context import UserContext
 from app.core.exceptions import MysteriousException
 from app.core.permissions import ADMIN_ROLE_CODE, ALL_PERMISSION_CODES, DEFAULT_ROLE_CODE, PERMISSION_USER
 from app.core.response import PageVO
-from app.core.security import check_password_strength, generate_token, hash_password, token_expire_time, verify_password
+from app.core.security import (
+    check_password_strength,
+    generate_token,
+    hash_password,
+    token_expire_time,
+    verify_password,
+)
 from app.crud import role as role_crud
 from app.crud import user as user_crud
 from app.crud import user_session as user_session_crud
@@ -22,7 +27,6 @@ from app.models.user import User
 from app.models.user_session import UserSession
 from app.schemas.user import CurrentUserVO, UpdatePasswordParam, UserParam, UserQuery, UserVO
 
-log = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
@@ -192,7 +196,7 @@ async def login(db: AsyncSession, param: UserParam) -> str:
 
 
 async def ensure_admin_user(db: AsyncSession) -> None:
-    """启动时检查并创建初始 admin 用户和内置角色。"""
+    """初始化内置角色并关联已有用户；admin 仅由数据库初始化脚本创建。"""
     admin_role = await _ensure_role(
         db,
         code=ADMIN_ROLE_CODE,
@@ -209,29 +213,13 @@ async def ensure_admin_user(db: AsyncSession) -> None:
     )
     default_role_id = await _default_role_id(db)
     legacy_users = await user_crud.list_by_role_id(db, 0)
-    changed = False
     for legacy_user in legacy_users:
         if legacy_user.username != "admin":
             legacy_user.role_id = default_role_id
-            changed = True
     existing = await user_crud.get_by_username(db, "admin")
-    if existing is not None:
-        if not existing.role_id:
-            existing.role_id = admin_role.id
-            changed = True
-        if changed:
-            await db.commit()
-        return
-
-    user = User(
-        username="admin",
-        password=hash_password("Emm@2025"),
-        real_name="管理员",
-        role_id=admin_role.id,
-    )
-    _refresh_token(user)
-    await user_crud.add(db, user)
-    log.info("初始 admin 用户已创建: admin / Emm@2025")
+    if existing is not None and not existing.role_id:
+        existing.role_id = admin_role.id
+    await db.commit()
 
 
 async def update_password(

@@ -18,6 +18,7 @@ from app.core.config_catalog import (
 from app.core.context import UserContext
 from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
+from app.core.shell_safety import validate_directory
 from app.crud import config as crud
 from app.models.config import Config
 from app.schemas.config import ConfigCategoryVO, ConfigParam, ConfigQuery, ConfigVO
@@ -33,6 +34,12 @@ def _check_param(param: ConfigParam) -> None:
         raise MysteriousException(Codes.PARAMS_EMPTY)
     if not (param.config_key and param.config_value and param.description):
         raise MysteriousException(Codes.PARAM_MISSING)
+
+
+def _validate_value(key: str, value: str) -> str:
+    if get_config_meta(key).value_type == "path":
+        validate_directory(value, key)
+    return value
 
 
 def _to_vo(obj: Config) -> ConfigVO:
@@ -54,6 +61,7 @@ def _matches_category(obj: Config, category: str | None) -> bool:
 
 async def add_config(db: AsyncSession, param: ConfigParam, user: UserContext) -> int:
     _check_param(param)
+    _validate_value(param.config_key or "", param.config_value or "")
     existing = await crud.get_by_key(db, param.config_key or "")
     if existing is not None:
         raise MysteriousException(Codes.CONFIG_EXIST)
@@ -77,6 +85,7 @@ async def update_config(
         return False
 
     sent = param.model_dump(exclude_unset=True, exclude_none=True, by_alias=False)
+    _validate_value(sent.get("config_key", existing.config_key), sent.get("config_value", existing.config_value))
     if "config_key" in sent:
         existing.config_key = sent["config_key"]
     if "config_value" in sent:
@@ -151,19 +160,21 @@ async def get_value(db: AsyncSession, key: str) -> str:
     """对齐 Java IConfigService.getValue：找不到抛 CONFIG_NOT_EXIST + key"""
     from app.core.config import get_settings
     if key == "MASTER_DATA_HOME" and get_settings().data_dir:
-        return get_settings().data_dir
+        return _validate_value(key, get_settings().data_dir)
     value = await crud.get_value(db, key)
     if value is None or value == "":
         raise MysteriousException(Codes.CONFIG_NOT_EXIST, message=f"配置不存在: {key}")
-    return value
+    return _validate_value(key, value)
 
 
 async def get_value_or_default(db: AsyncSession, key: str, default: str = "") -> str:
     from app.core.config import get_settings
     if key == "MASTER_DATA_HOME" and get_settings().data_dir:
-        return get_settings().data_dir
+        return _validate_value(key, get_settings().data_dir)
     value = await crud.get_value(db, key)
-    return value if value not in (None, "") else default
+    result = value if value not in (None, "") else default
+    # Empty defaults mean an optional path is not configured; callers may skip it.
+    return _validate_value(key, result) if result else result
 
 
 async def get_options(db: AsyncSession, type: str) -> list[str]:

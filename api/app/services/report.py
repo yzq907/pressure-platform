@@ -15,12 +15,13 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import delete as sql_delete
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import stamp_create, stamp_modify
 from app.core.codes import Codes
 from app.core.context import UserContext
-from app.core.enums import ExecType
+from app.core.enums import ExecType, TestCaseStatus
 from app.core.exceptions import MysteriousException
 from app.core.jmeter_error_samples import is_error_sample_artifact_name
 from app.core.response import PageVO
@@ -31,7 +32,9 @@ from app.models.report_transaction_metric_snapshot import ReportTransactionMetri
 from app.models.report_transaction_snapshot import ReportTransactionSnapshot
 from app.schemas.report import (
     ArtifactVO,
+    ReportBatchCleanVO,
     ReportByTestCaseQuery,
+    ReportCleanFailureVO,
     ReportParam,
     ReportQuery,
     ReportStatsVO,
@@ -230,9 +233,16 @@ async def clean_report(db: AsyncSession, id: int) -> bool:
     删除磁盘时取 report_dir 的父目录（../timestamp/ 级别），
     因为 report_dir 指向的是 data/ 或 jtl/ 子目录。
     """
-    report = await crud.get_by_id(db, id)
+    # Lock and refresh state even if this session already loaded an older report.
+    stmt = select(Report).where(Report.id == id).with_for_update().execution_options(populate_existing=True)
+    report = (await db.execute(stmt)).scalar_one_or_none()
     if report is None:
         raise MysteriousException(Codes.REPORT_NOT_EXIST)
+
+    if report.status not in {
+        TestCaseStatus.NOT_RUN.value, TestCaseStatus.RUN_SUCCESS.value, TestCaseStatus.RUN_FAILED.value,
+    }:
+        raise MysteriousException(Codes.FAIL, message="报告正在执行、排队或状态未知，不能删除")
 
     log.info("清理测试报告, id: %s", id)
     await db.execute(sql_delete(ReportMetricSnapshot).where(ReportMetricSnapshot.report_id == id))
@@ -245,6 +255,26 @@ async def clean_report(db: AsyncSession, id: int) -> bool:
     if clean_dir and os.path.exists(clean_dir):
         shutil.rmtree(clean_dir, ignore_errors=True)
     return True
+
+
+async def clean_reports(db: AsyncSession, ids: list[int]) -> ReportBatchCleanVO:
+    """逐项提交；失败回滚后继续，不并发复用同一个数据库会话。"""
+    result = ReportBatchCleanVO()
+    for report_id in dict.fromkeys(ids):
+        try:
+            await clean_report(db, report_id)
+        except MysteriousException as exc:
+            await db.rollback()
+            result.failures.append(ReportCleanFailureVO(id=report_id, message=str(exc)))
+        except Exception as exc:
+            await db.rollback()
+            log.error("批量清理报告失败: id=%s error_type=%s", report_id, type(exc).__name__)
+            result.failures.append(ReportCleanFailureVO(id=report_id, message="删除失败，请稍后重试或联系管理员"))
+        else:
+            result.deleted_ids.append(report_id)
+    result.success_count = len(result.deleted_ids)
+    result.failed_count = len(result.failures)
+    return result
 
 
 def _parent_timestamp_dir(report_dir: str) -> str | None:
@@ -301,7 +331,7 @@ def _compress_directory(src_dir: str, dest_zip: str) -> None:
 
 
 async def view_report(db: AsyncSession, id: int) -> str:
-    """预览报告：返回 index.html 的完整 URL。
+    """预览报告：由已鉴权的路由签发短期 HTML 预览链接。
 
     - 只有 RUNNING(exec_type=2) 类型报告可预览
     - 目录不存在 / 为空报错
@@ -321,26 +351,14 @@ async def view_report(db: AsyncSession, id: int) -> str:
         raise MysteriousException(Codes.REPORT_DIR_IS_EMPTY)
 
     from app.core.config import get_settings
-    from pathlib import Path
-    from urllib.parse import quote
-    if get_settings().data_dir:
-        try:
-            relative_path = Path(report_dir).resolve().relative_to(Path(get_settings().data_dir).resolve())
-        except ValueError:
-            raise MysteriousException(Codes.REPORT_DIR_NOT_EXIST, message="报告目录不在配置的数据目录中")
-        return "/reports/" + quote((relative_path / "index.html").as_posix(), safe="/")
+    from app.core.report_preview import create_preview_url
 
-    # 兼容旧部署的数据库配置
-    if "mysterious-data" in report_dir:
-        relative = report_dir.split("mysterious-data")[1]
-    else:
-        relative = report_dir.lstrip("/data")
-
-    if not relative.endswith("/"):
-        relative += "/"
-
-    host = await config_service.get_value(db, "MASTER_HOST_PORT")
-    return f"http://{host}/reports{relative}index.html"
+    try:
+        return create_preview_url(get_settings().data_dir, report_dir)
+    except (ValueError, OSError) as exc:
+        raise MysteriousException(
+            Codes.REPORT_DIR_NOT_EXIST, message="报告目录必须在配置的数据目录内且包含 index.html"
+        ) from exc
 
 
 

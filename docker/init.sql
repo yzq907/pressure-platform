@@ -13,6 +13,11 @@ CREATE TABLE `mysterious_user` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 COMMENT='用户信息表';
 
+-- Seed the initial administrator with a bcrypt hash. Never reset an existing account.
+INSERT INTO `mysterious_user` (`username`, `password`, `real_name`)
+SELECT 'admin', '$2b$12$59teUZvq15DAmtcr6EUFg.mUkY3.utT..xfmoTdQqj2fg69CsOPxG', '管理员'
+WHERE NOT EXISTS (SELECT 1 FROM `mysterious_user` WHERE `username` = 'admin');
+
 CREATE TABLE `mysterious_config` (
     `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
     `config_key` varchar(255) NOT NULL DEFAULT '' COMMENT '配置字段',
@@ -79,9 +84,15 @@ CREATE TABLE `mysterious_node` (
     `type` tinyint(4) NOT NULL DEFAULT '0' COMMENT '0-slave，1-master',
     `host` varchar(128) NOT NULL DEFAULT '' COMMENT '节点IP地址',
     `username` varchar(128) NOT NULL DEFAULT '' COMMENT '节点登陆用户名',
-    `password` varchar(128) NOT NULL DEFAULT '' COMMENT '节点登陆密码',
+    `password` text NOT NULL COMMENT 'SSH登录密码密文，由应用加密写入',
     `port` bigint(20) NOT NULL DEFAULT '0' COMMENT '节点登陆端口',
     `status` tinyint(4) NOT NULL DEFAULT '0' COMMENT '0-禁用中，1-启用中',
+    `region` varchar(255) NOT NULL DEFAULT '' COMMENT '区域',
+    `health_status` smallint NOT NULL DEFAULT 0 COMMENT '在线状态',
+    `last_heartbeat` datetime DEFAULT NULL COMMENT '上次心跳',
+    `cpu_usage` float NOT NULL DEFAULT 0 COMMENT 'CPU使用率',
+    `mem_usage` float NOT NULL DEFAULT 0 COMMENT '内存使用率',
+    `load_avg` float NOT NULL DEFAULT 0 COMMENT '系统负载',
     `creator_id` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人ID',
     `creator` varchar(32) NOT NULL DEFAULT '' COMMENT '创建人',
     `modifier_id` varchar(32) NOT NULL DEFAULT '' COMMENT '修改人ID',

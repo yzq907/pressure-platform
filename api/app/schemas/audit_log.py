@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
+from pydantic import Field
+
 from app.schemas.base import BaseQuery, BaseVO, CamelModel
 
 
@@ -34,3 +38,19 @@ class AuditLogQuery(BaseQuery):
     action: str | None = None
     resource_type: str | None = None
     resource_id: int | None = None
+
+
+class AuditLogBatchCleanParam(CamelModel):
+    ids: list[Annotated[int, Field(strict=True, gt=0)]] = Field(min_length=1, max_length=100)
+
+
+class AuditLogCleanFailureVO(CamelModel):
+    id: int
+    message: str
+
+
+class AuditLogBatchCleanVO(CamelModel):
+    deleted_ids: list[int] = Field(default_factory=list)
+    failures: list[AuditLogCleanFailureVO] = Field(default_factory=list)
+    success_count: int = 0
+    failed_count: int = 0

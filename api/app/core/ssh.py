@@ -21,6 +21,7 @@ import paramiko
 
 from app.core.codes import Codes
 from app.core.exceptions import MysteriousException
+from app.core.ssh_credentials import decrypt_password
 
 log = logging.getLogger(__name__)
 
@@ -68,13 +69,14 @@ class SSHClient:
                 pass
 
     def _connect(self) -> paramiko.SSHClient:
+        password = decrypt_password(self.password)
         c = paramiko.SSHClient()
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         c.connect(
             hostname=self.host,
             port=self.port,
             username=self.username,
-            password=self.password,
+            password=password,
             timeout=10,
             allow_agent=False,
             look_for_keys=False,

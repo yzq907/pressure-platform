@@ -25,6 +25,8 @@ from app.schemas.report import (
     CompareVO,
     ErrorSamplesVO,
     MetricsVO,
+    ReportBatchCleanParam,
+    ReportBatchCleanVO,
     ReportByTestCaseQuery,
     ReportQuery,
     ReportStatsVO,
@@ -120,6 +122,28 @@ async def clean_report(
     if ok:
         await audit_record(db, current, "DELETE", "report", id, detail=f"清理报告 #{id}")
     return success(ok)
+
+
+@router.post(
+    "/cleanBatch",
+    summary="批量清理报告（逐条返回成功和失败结果）",
+    response_model=Response[ReportBatchCleanVO],
+    response_model_by_alias=True,
+)
+async def clean_reports(
+    param: ReportBatchCleanParam,
+    current: UserContext = Depends(require_permission(PERMISSION_REPORT)),
+    db: AsyncSession = Depends(get_db),
+) -> Response[ReportBatchCleanVO]:
+    result = await service.clean_reports(db, param.ids)
+    for report_id in result.deleted_ids:
+        try:
+            await audit_record(db, current, "DELETE", "report", report_id, detail=f"批量清理报告 #{report_id}")
+        finally:
+            # The shared helper swallows audit errors; clear any failed transaction.
+            if db.in_transaction():
+                await db.rollback()
+    return success(result)
 
 
 @router.get(

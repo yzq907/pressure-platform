@@ -8,10 +8,19 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.codes import Codes
+from app.core.context import UserContext
+from app.core.exceptions import MysteriousException
 from app.core.response import PageVO
 from app.crud import audit_log as crud
 from app.models.audit_log import AuditLog
-from app.schemas.audit_log import AuditLogParam, AuditLogQuery, AuditLogVO
+from app.schemas.audit_log import (
+    AuditLogBatchCleanVO,
+    AuditLogCleanFailureVO,
+    AuditLogParam,
+    AuditLogQuery,
+    AuditLogVO,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 log = logging.getLogger(__name__)
@@ -68,3 +77,47 @@ async def get_log_list(
     )
     page_vo.list = [_to_vo(o) for o in items]
     return page_vo
+
+
+async def clean_logs(
+    db: AsyncSession,
+    ids: list[int],
+    current: UserContext,
+    ip: str,
+) -> AuditLogBatchCleanVO:
+    """在同一事务中删除指定日志并记录一次汇总审计。"""
+    ordered_ids = list(dict.fromkeys(ids))
+    try:
+        existing = set(await crud.lock_existing_ids(db, ordered_ids))
+        deleted_ids = [item_id for item_id in ordered_ids if item_id in existing]
+        failures = [
+            AuditLogCleanFailureVO(id=item_id, message="审计日志不存在或已被删除")
+            for item_id in ordered_ids
+            if item_id not in existing
+        ]
+        await crud.delete_ids(db, deleted_ids)
+        if deleted_ids:
+            db.add(
+                AuditLog(
+                    user_id=current.id,
+                    username=current.username,
+                    action="DELETE",
+                    resource_type="audit",
+                    resource_id=0,
+                    resource_name="审计日志",
+                    detail=f"批量删除审计日志 {len(deleted_ids)} 条，ID: {','.join(map(str, deleted_ids))}",
+                    ip=ip or "",
+                    create_time=datetime.now(SHANGHAI),
+                )
+            )
+        await db.commit()
+        return AuditLogBatchCleanVO(
+            deleted_ids=deleted_ids,
+            failures=failures,
+            success_count=len(deleted_ids),
+            failed_count=len(failures),
+        )
+    except Exception as exc:
+        await db.rollback()
+        log.exception("批量删除审计日志失败: %s", type(exc).__name__)
+        raise MysteriousException(Codes.FAIL, "批量删除审计日志失败，请稍后重试") from exc

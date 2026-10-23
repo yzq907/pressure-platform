@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Float, SmallInteger, String
+from sqlalchemy import BigInteger, DateTime, Float, SmallInteger, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import ID_TYPE, AuditMixin, Base
@@ -20,7 +20,7 @@ class Node(Base, AuditMixin):
     type: Mapped[int] = mapped_column(SmallInteger, default=0, server_default="0")
     host: Mapped[str] = mapped_column(String(128), default="", server_default="")
     username: Mapped[str] = mapped_column(String(128), default="", server_default="")
-    password: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    password: Mapped[str] = mapped_column(Text, default="")
     port: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     status: Mapped[int] = mapped_column(SmallInteger, default=0, server_default="0")
     region: Mapped[str] = mapped_column(String(255), default="", server_default="")
